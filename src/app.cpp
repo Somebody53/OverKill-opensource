@@ -6841,10 +6841,11 @@ void drawButton(Rectangle r, const char *label, bool enabled) {
 
 // Lobby: connect to the lobby server, list public lobbies, create or join lobbies.
 enum LobbyField { LobbyAddress, LobbyCreateName, LobbyCreatePass, LobbyJoinId, LobbyJoinPass, LobbyFieldCount };
-enum LobbyButton { LBConnect, LBRefresh, LBPaste, LBVisibility, LBMode, LBCreate, LBJoin, LBLeave, LBStart, LBMap, LBPlayBots, LBBack };
+enum LobbyButton { LBConnect, LBRefresh, LBPaste, LBVisibility, LBMode, LBCreate, LBJoin, LBLeave, LBStart, LBMap, LBPlayBots, LBDiscord, LBBack };
 constexpr int LobbyListVisible = 12;
 constexpr int LobbyMaxPlayers = 12;
 constexpr int LobbyMinStart = 2;
+constexpr const char *DiscordInvite = "https://discord.gg/4ce3aJME3y";
 
 constexpr float VoteSeconds = 20.0f;
 
@@ -6894,6 +6895,7 @@ Rectangle lobbyButtonBounds(int b) {
     case LBRefresh: return Rectangle{540.0f, 120.0f, 120.0f, 40.0f};
     case LBPaste: return Rectangle{670.0f, 120.0f, 170.0f, 40.0f};
     case LBPlayBots: return Rectangle{850.0f, 120.0f, 170.0f, 40.0f};
+    case LBDiscord: return Rectangle{1040.0f, 120.0f, 170.0f, 40.0f};
     case LBMap: return Rectangle{1040.0f, 570.0f, 170.0f, 40.0f};
     case LBVisibility: return Rectangle{680.0f, 270.0f, 170.0f, 40.0f};
     case LBMode: return Rectangle{870.0f, 270.0f, 170.0f, 40.0f};
@@ -7194,6 +7196,10 @@ bool updateLobby(LobbyMenu &lm) {
             lm.fields[LobbyAddress] = start == std::string::npos ? "" : text.substr(start);
         }
     }
+    if (hit(lobbyButtonBounds(LBDiscord))) {
+        SetClipboardText(DiscordInvite);
+        lm.status = "Discord link pasted to your clipboard";
+    }
     if (hit(lobbyButtonBounds(LBVisibility))) {
         lm.createPrivate = !lm.createPrivate;
     }
@@ -7286,6 +7292,7 @@ void drawLobby(const LobbyMenu &lm) {
     const std::string mapLabel = std::string("Map: ") + Maps[lm.map].name;
     drawButton(lobbyButtonBounds(LBMap), mapLabel.c_str(), !lm.started && (lm.joinedId < 0 || lm.isHost));
     drawButton(lobbyButtonBounds(LBPlayBots), "Play with bots", true);
+    drawButton(lobbyButtonBounds(LBDiscord), "Discord", true);
     if (lm.joinedId >= 0) {
         const std::string info = "Players: " + std::to_string(lm.players) + "/" + std::to_string(LobbyMaxPlayers) +
                                  "   Min to start: " + std::to_string(LobbyMinStart);
