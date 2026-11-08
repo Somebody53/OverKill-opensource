@@ -240,6 +240,9 @@ constexpr int MapCount = static_cast<int>(std::size(Maps));
 
 enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Lobby };
 
+// Set each frame: true while joined to a public lobby, which blocks mods.
+bool gModsLocked = false;
+
 enum Team { TeamBlue, TeamRed };
 
 enum Weapon {
@@ -1674,8 +1677,10 @@ void shoot(Game &g, Audio &a) {
                 g.enemies.erase(g.enemies.begin() + hitIndex);
             }
         }
-        for (const ModHitFn hook : modHitHooks()) {
-            hook(Vector3Add(g.cam.position, Vector3Scale(b.fwd, hitDist)));
+        if (!gModsLocked) {
+            for (const ModHitFn hook : modHitHooks()) {
+                hook(Vector3Add(g.cam.position, Vector3Scale(b.fwd, hitDist)));
+            }
         }
     }
 
@@ -6162,6 +6167,9 @@ Rectangle modsButtonRect() {
 }
 
 bool modsButtonPressed() {
+    if (gModsLocked) {
+        return false;
+    }
     return IsKeyPressed(KEY_TAB) ||
            (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), modsButtonRect()));
 }
@@ -6171,7 +6179,7 @@ void drawModsButton() {
     const bool hot = CheckCollisionPointRec(GetMousePosition(), r);
     DrawRectangleRec(r, hot ? Color{70, 74, 96, 255} : Color{40, 42, 56, 255});
     DrawRectangleLinesEx(r, 2.0f, RAYWHITE);
-    const char *label = "Mods (TAB)";
+    const char *label = gModsLocked ? "Mods locked" : "Mods (TAB)";
     DrawText(label, static_cast<int>(r.x + r.width / 2) - MeasureText(label, 22) / 2, static_cast<int>(r.y) + 9, 22,
              RAYWHITE);
 }
@@ -6861,6 +6869,8 @@ struct LobbyMenu {
     int map = 0;
     std::string pendingMode;
     bool pendingCreate = false;
+    bool pendingPrivate = false;
+    bool joinedPrivate = false;
     int pendingPlayers = 1;
     bool isHost = false;
     bool started = false;
@@ -7000,6 +7010,7 @@ void lobbyCreate(LobbyMenu &lm) {
     }
     lm.pendingMode = lm.createTeams ? "teams" : "deathmatch";
     lm.pendingCreate = true;
+    lm.pendingPrivate = lm.createPrivate;
     lm.pendingPlayers = 1;
     lm.conn.sendLine("CREATE " + name + (lm.createPrivate ? " private " : " public ") +
                      (lm.createPrivate ? pass : std::string("-")) + " " + lm.pendingMode);
@@ -7017,12 +7028,16 @@ void lobbyJoin(LobbyMenu &lm, const std::string &id, const std::string &pass) {
     lm.pendingMode.clear();
     lm.pendingCreate = false;
     lm.pendingPlayers = 1;
+    bool listed = false;
     for (const LobbyInfo &info : lm.lobbies) {
         if (std::to_string(info.id) == id) {
             lm.pendingMode = info.mode;
             lm.pendingPlayers = info.players + 1;
+            listed = true;
         }
     }
+    // Unlisted lobbies that take a password are private.
+    lm.pendingPrivate = !listed && !pass.empty();
     lm.conn.sendLine("JOIN " + id + " " + (pass.empty() ? std::string("-") : pass));
 }
 
@@ -7043,6 +7058,7 @@ void lobbyHandleLine(LobbyMenu &lm, const std::string &line) {
         int id = -1;
         if (ss >> id) {
             lm.joinedId = id;
+            lm.joinedPrivate = lm.pendingPrivate;
             lm.joinedMode = lm.pendingMode;
             lm.isHost = lm.pendingCreate;
             lm.players = lm.pendingPlayers;
@@ -7052,6 +7068,7 @@ void lobbyHandleLine(LobbyMenu &lm, const std::string &line) {
                         (lm.joinedMode.empty() ? std::string() : " (" + lm.joinedMode + ")");
         } else {
             lm.joinedId = -1;
+            lm.joinedPrivate = false;
             lm.joinedMode.clear();
             lm.isHost = false;
             lm.started = false;
@@ -7881,6 +7898,7 @@ int main() {
 
     while (!WindowShouldClose()) {
         const float dt = GetFrameTime();
+        gModsLocked = lobbyMenu.joinedId >= 0 && !lobbyMenu.joinedPrivate;
         handleMusicKeys(audio.playlist);
         updatePlaylist(audio.playlist);
 
@@ -8054,8 +8072,10 @@ int main() {
             continue;
         }
         update(game, audio, dt);
-        for (const ModPlayFn hook : modPlayHooks()) {
-            hook(dt);
+        if (!gModsLocked) {
+            for (const ModPlayFn hook : modPlayHooks()) {
+                hook(dt);
+            }
         }
 
         if (!gSettings.potato) {
