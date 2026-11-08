@@ -1,0 +1,111 @@
+OVERKILL MOD TUTORIAL
+=====================
+
+Mods are small C++ files that add pages to the Mods screen and react to the game.
+
+
+1. HOW MODS LOAD
+----------------
+- Put your mod in the mods/ folder of the project as a .cpp file, e.g. mods/11_mymod.cpp.
+- "make" copies mods/*.cpp into build/mods/ together with modapi.h and raylib.h.
+- At startup the game compiles every build/mods/*.cpp into a .so file and loads it.
+  Files load in alphabetical order, so numeric prefixes control the order.
+- If a mod fails to compile, the error is written to build/mods/<name>.log and the game keeps running.
+- After editing a mod, run "make" and restart the game to reload it.
+
+
+2. THE MINIMUM MOD
+------------------
+    #include "modapi.h"
+
+    namespace {
+    void drawPage(float dt) {
+        (void)dt;
+        DrawText("Hello!", 60, 200, 28, RAYWHITE);
+    }
+    } // namespace
+
+    extern "C" void modInit(ModApi *api) {
+        if (api->version != MOD_API_VERSION) {
+            return;
+        }
+        api->addPage("Hello", drawPage);
+    }
+
+Rules:
+- Each mod file exports one function: extern "C" void modInit(ModApi *api).
+- Put helpers in an anonymous namespace so they do not clash with other mods.
+- Check api->version against MOD_API_VERSION before using the API.
+- Mods may use raylib (DrawText, IsKeyPressed, TextFormat, ...) and the C++ standard library.
+
+
+3. THE API (MOD_API_VERSION 2)
+------------------------------
+The ModApi struct has these members:
+
+  int  version                      The API version. Currently 2.
+  addPage(title, draw)              Adds a page to the Mods screen. title is the list entry.
+  setPlayHook(fn)                   Registers fn(float dt), called every frame during play.
+  addScore(points)                  Adds points to the player's score.
+  heal(amount)                      Restores HP to the player (amount is in HP).
+  refillAmmo()                      Refills the player's weapon ammo.
+  explodeAt(pos)                    Creates an explosion at a Vector3 world position.
+  setBulletHitHook(fn)              Registers fn(Vector3 pos), called for each bullet hit on an enemy.
+  killAllEnemies()                  Kills every enemy on the map.
+
+Hooks:
+- Any number of play hooks and bullet hooks can be registered. Every registered hook runs,
+  in load order. Calling setPlayHook or setBulletHitHook again does not replace the earlier hook.
+- Play hooks run once per frame, after the world update and before drawing.
+- Bullet hooks run each time a bullet hits an enemy.
+- The ModApi functions addScore, heal, refillAmmo, explodeAt and killAllEnemies only take
+  effect during play.
+
+Pages:
+- A page is drawn each frame while it is open in the Mods screen. Read keys in the page
+  with IsKeyPressed.
+- Pages run only in the Mods screen, not during play. The usual pattern: the page sets a
+  flag, and the play hook acts on it (see examples 02, 03 and 07).
+
+
+4. MODS SCREEN CONTROLS
+-----------------------
+- Open it from the main menu with TAB or the "Mods (TAB)" button.
+- UP/DOWN or W/S: select a mod. ENTER: open its page.
+- ESC: on a page, go back to the list. In the list, go back to the main menu.
+
+
+5. EXAMPLE MODS
+---------------
+The mods/ folder contains ten working examples, each covering one or more API functions.
+
+  01_hello_page.cpp        addPage. The smallest possible mod.
+  02_score_bonus.cpp       addScore, setPlayHook. Press B to arm a 100 point bonus.
+  03_auto_heal.cpp         heal, setPlayHook. Press H to toggle regeneration.
+  04_infinite_ammo.cpp     refillAmmo, setPlayHook. Press I to toggle endless ammo.
+  05_hit_counter.cpp       setBulletHitHook, addScore. Each hit scores 5 points.
+  06_tenth_hit_blast.cpp   setBulletHitHook, explodeAt. Press G; every 10th hit explodes.
+  07_nuke_button.cpp       killAllEnemies, setPlayHook. Press N to arm a nuke.
+  08_timed_airstrike.cpp   explodeAt, setPlayHook, setBulletHitHook. Shells the last impact every 12 s.
+  09_score_clock.cpp       addScore, setPlayHook. Press K; 1 point per second of play.
+  10_api_version_page.cpp  version check, addPage. Shows the API version and function list.
+
+The examples use the keys B, H, I, G, N, R and K on their pages. If you write your own
+mod, pick keys that no other mod uses. Copy an example as a starting point and change it.
+
+
+6. TIPS
+-------
+- Pages should not change gameplay directly. Arm a flag in the page and act in a play hook.
+- Hooks run every frame or every hit, so keep them cheap. Do not allocate memory every frame.
+- Use file-scope variables for state that must survive across frames.
+- If a mod has no effect, check build/mods/<name>.log for compile errors and the console
+  output for "failed to compile", "failed to load" or "has no modInit" messages.
+
+
+7. CHANGES IN VERSION 2
+-----------------------
+- setPlayHook and setBulletHitHook used to keep only the last hook registered.
+  Now every hook runs, so mods can be combined without conflicts.
+- killAllEnemies was added.
+- Mods that check for version 2 must use MOD_API_VERSION from modapi.h.

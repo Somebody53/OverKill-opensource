@@ -1,0 +1,11 @@
+[package]
+name = "ai_brain"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ai_brain"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
