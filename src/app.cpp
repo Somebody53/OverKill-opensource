@@ -8,6 +8,7 @@
 #include "mods.h"
 #include "skins.h"
 #include "lobby_net.h"
+#include "server_lookup.h"
 #include <sstream>
 
 // C interface of src/ai_rs (Rust enemy brain). Field order matches the Rust #[repr(C)] structs.
@@ -36,6 +37,8 @@ void ai_think(const AiUnit *units, int32_t count, const AiCand *cands, double dt
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <future>
 #include <fstream>
 #include <map>
 #include <string>
@@ -376,6 +379,8 @@ Look gPlayerLook;
 constexpr size_t MaxNameLen = 16;
 std::string gPlayerName;
 std::string gServerAddress = "127.0.0.1:7777";
+std::string gPlayerCustomId;
+std::future<ServerLookup> gServerLookup;
 
 // Overcoins, boxes, keys and owned skins. Saved to inventory.cfg.
 Inventory gInv;
@@ -6364,7 +6369,8 @@ void saveSettings() {
         << "logo=" << gPlayerLook.logo << '\n'
         << "shirt=" << gPlayerLook.shirt << '\n'
         << "name=" << gPlayerName << '\n'
-        << "server=" << gServerAddress << '\n';
+        << "server=" << gServerAddress << '\n'
+        << "playerid=" << gPlayerCustomId << '\n';
 }
 
 void loadSettings() {
@@ -6382,6 +6388,10 @@ void loadSettings() {
         }
         if (key == "server") {
             gServerAddress = line.substr(eq + 1);
+            continue;
+        }
+        if (key == "playerid") {
+            gPlayerCustomId = line.substr(eq + 1);
             continue;
         }
         const int value = std::atoi(line.c_str() + eq + 1);
@@ -6922,7 +6932,7 @@ void drawButton(Rectangle r, const char *label, bool enabled) {
 
 // Lobby: connect to the lobby server, list public lobbies, create or join lobbies.
 enum LobbyField { LobbyAddress, LobbyCreateName, LobbyCreatePass, LobbyJoinId, LobbyJoinPass, LobbyFieldCount };
-enum LobbyButton { LBConnect, LBRefresh, LBPaste, LBVisibility, LBMode, LBCreate, LBJoin, LBLeave, LBStart, LBMap, LBPlayBots, LBDiscord, LBBack };
+enum LobbyButton { LBConnect, LBRefresh, LBPaste, LBVisibility, LBMode, LBCreate, LBJoin, LBLeave, LBStart, LBMap, LBPlayBots, LBDiscord, LBBack, LBFindIp };
 constexpr int LobbyListVisible = 12;
 constexpr int LobbyMaxPlayers = 12;
 constexpr int LobbyMinStart = 2;
@@ -6987,6 +6997,7 @@ Rectangle lobbyButtonBounds(int b) {
     case LBJoin: return Rectangle{680.0f, 510.0f, 360.0f, 40.0f};
     case LBLeave: return Rectangle{680.0f, 570.0f, 170.0f, 40.0f};
     case LBStart: return Rectangle{870.0f, 570.0f, 170.0f, 40.0f};
+    case LBFindIp: return Rectangle{220.0f, 30.0f, 170.0f, 44.0f};
     default: return Rectangle{40.0f, 650.0f, 160.0f, 44.0f};
     }
 }
@@ -7220,8 +7231,35 @@ void updateVote(LobbyMenu &lm, float dt) {
     }
 }
 
+// Applies the PlayFab server address once the background lookup has finished.
+void applyServerLookup(LobbyMenu &lm) {
+    if (!gServerLookup.valid() ||
+        gServerLookup.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;
+    }
+    const ServerLookup found = gServerLookup.get();
+    if (!found.ok) {
+        lm.status = "PlayFab lookup failed: " + found.error;
+        return;
+    }
+    gServerAddress = found.address;
+    lm.fields[LobbyAddress] = found.address;
+    saveSettings();
+    lm.status = "Server address loaded from PlayFab";
+}
+
+void startServerLookup(LobbyMenu &lm) {
+    if (gServerLookup.valid() && gServerLookup.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        lm.status = "Already searching PlayFab...";
+        return;
+    }
+    gServerLookup = std::async(std::launch::async, lookupServerAddress, gPlayerCustomId);
+    lm.status = "Searching PlayFab for the server address...";
+}
+
 // Returns true when the player leaves the lobby screen.
 bool updateLobby(LobbyMenu &lm) {
+    applyServerLookup(lm);
     const bool wasOpen = lm.conn.isOpen();
     for (const std::string &line : lm.conn.poll()) {
         lobbyHandleLine(lm, line);
@@ -7291,6 +7329,9 @@ bool updateLobby(LobbyMenu &lm) {
             lm.fields[LobbyAddress] = start == std::string::npos ? "" : text.substr(start);
         }
     }
+    if (hit(lobbyButtonBounds(LBFindIp))) {
+        startServerLookup(lm);
+    }
     if (hit(lobbyButtonBounds(LBDiscord))) {
         SetClipboardText(DiscordInvite);
         lm.status = "Discord link pasted to your clipboard";
@@ -7352,6 +7393,7 @@ void drawLobby(const LobbyMenu &lm) {
     drawButton(lobbyButtonBounds(LBConnect), "Connect", true);
     drawButton(lobbyButtonBounds(LBRefresh), "Refresh", lm.conn.isOpen());
     drawButton(lobbyButtonBounds(LBPaste), "Paste", true);
+    drawButton(lobbyButtonBounds(LBFindIp), "Find IP", true);
 
     DrawText("Public lobbies", 40, 190, 22, RAYWHITE);
     const int count = static_cast<int>(lm.lobbies.size());
@@ -7902,6 +7944,11 @@ int main() {
     SetWindowMinSize(640, 360);
     SetExitKey(KEY_NULL);
     loadSettings();
+    if (gPlayerCustomId.empty()) {
+        gPlayerCustomId = makeCustomId();
+        saveSettings();
+    }
+    gServerLookup = std::async(std::launch::async, lookupServerAddress, gPlayerCustomId);
     loadInventory(gInv, inventoryFilePath());
     applyDisplay();
     initGraphics();

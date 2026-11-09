@@ -9,9 +9,9 @@ AI_LIB := $(AI_DIR)/target/release/libai_brain.a
 
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -I$(RAYLIB_DIR)/src -Ibuild
 GFX_LIBS := -lGL -lm -lpthread -ldl -lrt -lX11 -lutil -lgcc_s
-LDLIBS   := $(GFX_LIBS)
+LDLIBS   := $(GFX_LIBS) -lcurl
 
-SOURCES := src/app.cpp src/world.cpp src/mods.cpp src/lobby_net.cpp
+SOURCES := src/app.cpp src/world.cpp src/mods.cpp src/lobby_net.cpp src/server_lookup.cpp
 MKLOGO      := build/mklogo
 LOGO_HEADER := build/logo_data.h
 LOGO_PNG    := assets/logo.png
@@ -74,7 +74,7 @@ WIN_OBJ_DIR    := $(WIN_DIR)/obj
 WIN_OBJECTS    := $(patsubst src/%.cpp,$(WIN_OBJ_DIR)/%.o,$(SOURCES))
 WIN_TARGET     := $(WIN_DIR)/OverKillOpensource.exe
 WIN_CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -I$(WIN_RAYLIB_DIR)/src -Ibuild
-WIN_LDLIBS     := -lopengl32 -lgdi32 -lwinmm -lws2_32 -lpthread -luserenv -lbcrypt -ladvapi32 -lntdll
+WIN_LDLIBS     := -lopengl32 -lgdi32 -lwinmm -lws2_32 -lpthread -luserenv -lbcrypt -ladvapi32 -lntdll -lwinhttp
 
 # Windows cross-build (mingw-w64). Raylib is built from a copy so the Linux objects are untouched.
 $(WIN_RAYLIB_LIB):
