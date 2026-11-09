@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+inline constexpr const char *GameVersion = "1.0.4";
+
 // One entry from the server's LIST reply.
 struct LobbyInfo {
     int id = 0;

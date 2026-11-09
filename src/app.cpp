@@ -112,6 +112,8 @@ constexpr int StartMoney = 800;
 constexpr int RoundWinMoney = 1500;
 constexpr float IntermissionMin = 10.0f;
 constexpr float IntermissionMax = 15.0f;
+constexpr float RoundEndTime = 5.0f;   // online: seconds locked after a round ends
+constexpr float RoundBuyTime = 10.0f;  // online: seconds to buy before the next round
 // Enemy money: StartMoney plus this much each wave, spent on guns.
 constexpr int EnemyIncomePerWave = 900;
 constexpr size_t MaxCorpses = 24;
@@ -682,20 +684,21 @@ struct Game {
     bool netHost = false;        // online: this client is the lobby host and drives the cars
     int localFd = 0;             // online: our lobby id
     Team localTeam = TeamBlue;   // online: our side in team mode
-    bool dead = false;           // online: waiting to respawn
-    float deathTimer = 0.0f;     // online: seconds until respawn
+    bool dead = false;           // online: dead until the next round starts
     bool deathSent = false;      // online: DEATH already sent for this life
     int lastAttacker = 0;        // online: lobby id of the last player who hurt us
     int lastWeapon = -1;         // online: weapon of that hit
     bool lastHead = false;       // online: that hit was a headshot
     std::vector<std::string> netOut; // online: lines waiting to be sent
+    bool roundLive = false;          // online: a round is being fought
+    int roundPlayers = 0;            // online: most players seen alive this round
+    std::string roundMsg;            // online: who won the last round
     float netSendTimer = 0.0f;
     float carSendTimer = 0.0f;
 };
 
 constexpr float KillFeedTime = 6.0f;
 constexpr size_t KillFeedMax = 5;
-constexpr float RespawnTime = 3.0f;      // online: seconds dead before respawning
 constexpr float NetSendInterval = 0.1f;  // online: seconds between player state updates
 constexpr float CarSendInterval = 0.2f;  // online: seconds between car snapshots from the host
 
@@ -3005,11 +3008,85 @@ void shopKeyMap(const Game &g, int (&keyOf)[ShopCount]) {
     }
 }
 
+void placeOnlineSpawn(Game &g);
+
+// Online: starts a round with every player back at spawn.
+void startOnlineRound(Game &g) {
+    g.roundLive = true;
+    g.roundPlayers = 0;
+    g.roundMsg.clear();
+    g.dead = false;
+    g.deathSent = false;
+    g.lastAttacker = 0;
+    g.lastWeapon = -1;
+    g.lastHead = false;
+    placeOnlineSpawn(g);
+}
+
+// Online: ends the round when one player, or one team, is left alive.
+void checkOnlineRoundEnd(Game &g) {
+    int alive = 0;
+    int aliveBlue = 0;
+    int aliveRed = 0;
+    int lastFd = g.localFd;
+    if (!g.dead) {
+        ++alive;
+        if (g.localTeam == TeamBlue) {
+            ++aliveBlue;
+        } else {
+            ++aliveRed;
+        }
+    }
+    for (const Enemy &e : g.enemies) {
+        if (e.netId == 0) {
+            continue;
+        }
+        ++alive;
+        if (e.team == TeamBlue) {
+            ++aliveBlue;
+        } else {
+            ++aliveRed;
+        }
+        lastFd = e.netId;
+    }
+    g.roundPlayers = std::max(g.roundPlayers, alive);
+    if (g.roundPlayers < 2) {
+        return;
+    }
+    if (gSettings.teamMode) {
+        if (aliveBlue > 0 && aliveRed > 0) {
+            return;
+        }
+        g.roundMsg = aliveBlue > 0 ? "Blue team won the round" : aliveRed > 0 ? "Red team won the round" : "No one won the round";
+    } else {
+        if (alive > 1) {
+            return;
+        }
+        if (alive == 0) {
+            g.roundMsg = "No one won the round";
+        } else if (lastFd == g.localFd) {
+            g.roundMsg = "You won the round";
+        } else {
+            g.roundMsg = playerName(g, lastFd) + " won the round";
+        }
+    }
+    g.roundLive = false;
+    g.intermission = RoundEndTime + RoundBuyTime;
+}
+
 // Counts down between waves, spawns the next wave, and pays out when a round is won.
 void updateRound(Game &g, Audio &a, float dt) {
     if (g.online) {
-        // Online: only the start countdown runs; there are no waves to spawn.
-        g.intermission = std::max(0.0f, g.intermission - dt);
+        // Online rounds: a countdown runs between rounds, then the next round starts.
+        if (g.intermission > 0.0f) {
+            g.intermission -= dt;
+            if (g.intermission <= 0.0f) {
+                g.intermission = 0.0f;
+                startOnlineRound(g);
+            }
+        } else if (g.roundLive) {
+            checkOnlineRoundEnd(g);
+        }
         return;
     }
     if (g.intermission > 0.0f) {
@@ -3265,7 +3342,7 @@ bool returnLastBuy(Game &g, const Audio &a) {
 
 // B opens the buy menu between waves; it closes on B, ESC, or when the wave starts.
 void updateShop(Game &g, const Audio &a) {
-    const bool shopTime = g.intermission > 0.0f || (g.online && g.dead);
+    const bool shopTime = g.online ? (g.intermission > 0.0f && g.intermission <= RoundBuyTime) : g.intermission > 0.0f;
     if (!shopTime) {
         if (g.shopOpen) {
             g.shopOpen = false;
@@ -3636,11 +3713,19 @@ void drawRoundOverlay(const Game &g) {
                  Fade(RAYWHITE, std::min(1.0f, g.waveBanner)));
     }
     if (g.intermission > 0.0f) {
-        const std::string msg = (g.online ? std::string("Match starts in ") : "Wave " + std::to_string(g.wave + 1) + " in ") +
-                                std::to_string(static_cast<int>(std::ceil(g.intermission))) + " s";
+        const bool buyOpen = !g.online || g.intermission <= RoundBuyTime;
+        const int secs = static_cast<int>(std::ceil(g.intermission));
+        std::string msg;
+        if (!g.online) {
+            msg = "Wave " + std::to_string(g.wave + 1) + " in " + std::to_string(secs) + " s";
+        } else if (buyOpen) {
+            msg = "Buy time: " + std::to_string(secs) + " s";
+        } else {
+            msg = g.roundMsg + " - buying in " + std::to_string(static_cast<int>(std::ceil(g.intermission - RoundBuyTime))) + " s";
+        }
         const int w = MeasureText(msg.c_str(), 40);
         DrawText(msg.c_str(), (GetScreenWidth() - w) / 2, 120, 40, RAYWHITE);
-        if (!g.shopOpen) {
+        if (buyOpen && !g.shopOpen) {
             const int hw = MeasureText("Press B to buy weapons", 24);
             DrawText("Press B to buy weapons", (GetScreenWidth() - hw) / 2, 170, 24, GOLD);
         }
@@ -3650,7 +3735,7 @@ void drawRoundOverlay(const Game &g) {
     }
 }
 
-// Online: a player who runs out of health waits, then respawns. The match itself keeps going.
+// Online: a player who runs out of health stays out until the next round starts.
 void placeOnlineSpawn(Game &g) {
     Vector3 p = g.level.spawn;
     if (!gSettings.teamMode) {
@@ -3676,25 +3761,13 @@ void placeOnlineSpawn(Game &g) {
     g.lastHealth = PlayerMaxHealth;
 }
 
-void updateOnlineLife(Game &g, float dt) {
-    if (!g.dead) {
-        if (g.health <= 0.0f) {
-            g.dead = true;
-            g.deathSent = false;
-            g.deathTimer = RespawnTime;
-            g.health = 0.0f;
-            g.lastHit = "You were killed";
-            g.hitTextTimer = 2.0f;
-        }
-        return;
-    }
-    g.deathTimer -= dt;
-    if (g.deathTimer <= 0.0f) {
-        g.dead = false;
-        g.lastAttacker = 0;
-        g.lastWeapon = -1;
-        g.lastHead = false;
-        placeOnlineSpawn(g);
+void updateOnlineLife(Game &g) {
+    if (!g.dead && g.health <= 0.0f) {
+        g.dead = true;
+        g.deathSent = false;
+        g.health = 0.0f;
+        g.lastHit = "You were killed";
+        g.hitTextTimer = 2.0f;
     }
 }
 
@@ -3865,7 +3938,7 @@ void update(Game &g, Audio &a, float dt) {
     }
     g.lastHealth = g.health;
     if (g.online) {
-        updateOnlineLife(g, dt);
+        updateOnlineLife(g);
         return;
     }
     if (g.health <= 0.0f) {
@@ -6886,6 +6959,7 @@ struct LobbyMenu {
     int editing = -1;
     int myFd = 0;                // our lobby id, from YOU
     int myTeam = -1;             // our team index from TEAM (-1 = deathmatch)
+    bool outdated = false;       // server rejected our game version
 };
 
 Rectangle lobbyFieldRect(int f) {
@@ -6951,6 +7025,7 @@ std::string lobbyErrorText(const std::string &code) {
     if (code == "not_host") return "Only the host can start the lobby";
     if (code == "not_enough_players") return "Need at least 2 players to start";
     if (code == "teams_need_even") return "Team mode needs an even number of players";
+    if (code == "version_mismatch" || code == "version_required") return "Upgrade your game please";
     return "Server error: " + code;
 }
 
@@ -6983,6 +7058,8 @@ void lobbyConnect(LobbyMenu &lm) {
         lm.status = err + " - check the address and press Connect";
         return;
     }
+    lm.outdated = false;
+    lm.conn.sendLine(std::string("HELLO ") + GameVersion);
     // Connect time is used as the ping estimate.
     lm.pingMs = static_cast<int>((GetTime() - start) * 1000.0);
     gServerAddress = lm.fields[LobbyAddress];
@@ -7081,6 +7158,7 @@ void lobbyHandleLine(LobbyMenu &lm, const std::string &line) {
         std::string code;
         ss >> code;
         lm.status = lobbyErrorText(code);
+        lm.outdated = code == "version_mismatch" || code == "version_required";
         lm.pendingMode.clear();
         lm.pendingCreate = false;
     } else if (cmd == "PLAYER_JOINED") {
@@ -7152,7 +7230,7 @@ bool updateLobby(LobbyMenu &lm) {
         lm.joinedId = -1;
         lm.joinedMode.clear();
         lm.listing = false;
-        lm.status = "Disconnected from the server";
+        lm.status = lm.outdated ? "Upgrade your game please" : "Disconnected from the server";
     }
 
     bool escUsed = false;
@@ -7792,7 +7870,10 @@ void startOnlineMatch(Game &g, const LobbyMenu &lm) {
     g.localTeam = lm.myTeam == 1 ? TeamRed : TeamBlue;
     g.dead = false;
     g.deathSent = false;
-    g.deathTimer = 0.0f;
+    g.intermission = RoundBuyTime;
+    g.roundLive = false;
+    g.roundPlayers = 0;
+    g.roundMsg.clear();
     g.netOut.clear();
     g.netSendTimer = 0.0f;
     g.carSendTimer = 0.0f;
@@ -8121,7 +8202,7 @@ int main() {
         drawHud(game, audio.playlist);
         drawRoundOverlay(game);
         if (game.online && game.dead) {
-            const char *text = TextFormat("You were killed - respawning in %d", static_cast<int>(std::ceil(game.deathTimer)));
+            const char *text = "You were killed - wait for the next round";
             DrawText(text, GetScreenWidth() / 2 - MeasureText(text, 30) / 2, GetScreenHeight() / 2 - 15, 30, RED);
         }
         EndDrawing();
