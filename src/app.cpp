@@ -70,7 +70,7 @@ constexpr float SemiCooldown = 0.3f;
 constexpr float KnifeCooldown = 0.45f;
 constexpr float KnifeRange = 2.4f;
 constexpr float KnifeCone = 0.6f;
-constexpr int KnifePoints = 5;
+constexpr int KnifePoints = 2;
 constexpr float BaseFov = 70.0f;
 constexpr float ScopeFov = 18.0f;
 constexpr float TracerTime = 0.05f;
@@ -467,10 +467,10 @@ Vector3 enemyPoint(const Enemy &e, float sideOffset, float y) {
 
 std::vector<Target> targetsOf(const Enemy &e) {
     return {
-        {enemyPoint(e, 0.0f, HeadY), HeadRadius, 300, "HEAD"},
-        {enemyPoint(e, 0.0f, 0.9f), TorsoRadius, 100, "BODY"},
-        {enemyPoint(e, 0.45f, 0.93f), ArmRadius, 50, "ARM"},
-        {enemyPoint(e, -0.45f, 0.93f), ArmRadius, 50, "ARM"},
+        {enemyPoint(e, 0.0f, HeadY), HeadRadius, 120, "HEAD"},
+        {enemyPoint(e, 0.0f, 0.9f), TorsoRadius, 40, "BODY"},
+        {enemyPoint(e, 0.45f, 0.93f), ArmRadius, 20, "ARM"},
+        {enemyPoint(e, -0.45f, 0.93f), ArmRadius, 20, "ARM"},
     };
 }
 
@@ -614,6 +614,7 @@ struct Game {
     float pitch = 0.0f;
     Vector3 pos{};
     int money = StartMoney;
+    int roundKillMoney = 0;     // combat money earned this wave, kept when the player respawns
     int shots = 0;
     int hits = 0;
     int wave = 0;
@@ -1024,6 +1025,7 @@ void spawnAlly(Game &g, int weapon) {
 
 void spawnWave(Game &g) {
     ++g.wave;
+    g.roundKillMoney = 0;
     // Purchases can only be returned before the wave they were made for starts.
     g.buyHistory.clear();
     // Guns on the floor from the last round are removed; fights start with a clean map.
@@ -1223,6 +1225,41 @@ void resetGame(Game &g, int mapIndex) {
     for (int i = 0; i < AmmoBoxMax / 2; ++i) {
         spawnAmmoBox(g);
     }
+}
+
+// Offline death: respawn at spawn with the starting loadout, keeping the wave's kill money.
+void respawnPlayer(Game &g) {
+    g.money = StartMoney + g.roundKillMoney;
+    g.health = PlayerMaxHealth;
+    g.lastHealth = PlayerMaxHealth;
+    g.armor = 0.0f;
+    g.pos = g.level.spawn;
+    g.pos.y = groundAt(g.level.terrain, g.pos.x, g.pos.z);
+    g.height = StandHeight;
+    g.vy = 0.0f;
+    g.grounded = true;
+    g.cam.position = {g.pos.x, g.pos.y + g.height - 0.15f, g.pos.z};
+    for (int w = 0; w < WeaponCount; ++w) {
+        g.owned[w] = false;
+        g.mags[w] = 0;
+    }
+    g.owned[WeaponPistol] = true;
+    g.owned[WeaponKnife] = true;
+    g.owned[WeaponTaser] = true;
+    g.mags[WeaponPistol] = Weapons[WeaponPistol].mag;
+    g.weapon = WeaponPistol;
+    g.sidearm = WeaponPistol;
+    g.primary = -1;
+    g.reserve = StartReserve;
+    for (int t = 0; t < ThrowCount; ++t) {
+        g.stock[t] = 0;
+    }
+    g.reloadTimer = 0.0f;
+    g.holding = false;
+    g.scoped = false;
+    g.shopOpen = false;
+    g.lastHit = "You were killed";
+    g.hitTextTimer = 2.0f;
 }
 
 Vector3 carCenter(const Car &c) {
@@ -1667,6 +1704,7 @@ void shoot(Game &g, Audio &a) {
         Enemy &victim = g.enemies[hitIndex];
         ++g.hits;
         g.money += hit.points;
+        g.roundKillMoney += hit.points;
         g.lastHit = std::string(hit.name) + " +" + std::to_string(hit.points);
         g.hitTextTimer = 1.0f;
         if (victim.netId != 0) {
@@ -1796,6 +1834,7 @@ void stab(Game &g) {
     victim.hp = 0;
     ++g.hits;
     g.money += KnifePoints;
+    g.roundKillMoney += KnifePoints;
     g.lastHit = "Knife +" + std::to_string(KnifePoints);
     g.hitTextTimer = 1.0f;
 }
@@ -2502,7 +2541,8 @@ void explode(Game &g, Vector3 at, Audio *a) {
             addKill(g, KillEntry{"You", GOLD, "HE grenade", botName(e), teamColor(e.team), false,
                                  e.blind > 0.0f, false});
             e.hp = 0;
-            g.money += 100;
+            g.money += 40;
+            g.roundKillMoney += 40;
         }
     }
     reapEnemies(g);
@@ -3947,9 +3987,7 @@ void update(Game &g, Audio &a, float dt) {
         return;
     }
     if (g.health <= 0.0f) {
-        resetGame(g, g.mapIndex);
-        g.lastHit = "You were killed";
-        g.hitTextTimer = 2.0f;
+        respawnPlayer(g);
         return;
     }
 }
