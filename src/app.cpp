@@ -71,6 +71,11 @@ constexpr float KnifeCooldown = 0.45f;
 constexpr float KnifeRange = 2.4f;
 constexpr float KnifeCone = 0.6f;
 constexpr int KnifePoints = 2;
+constexpr float KnifeThrowSpeed = 34.0f;
+constexpr float KnifeThrowLife = 1.5f;   // seconds of flight before the knife drops
+constexpr float KnifeGravity = 4.0f;
+constexpr float KnifeThrowHit = 0.35f;   // hit radius around a target's chest
+constexpr float KnifeReturnTime = 0.8f;  // seconds after landing until the knife is back in hand
 constexpr float BaseFov = 70.0f;
 constexpr float ScopeFov = 18.0f;
 constexpr float TracerTime = 0.05f;
@@ -88,7 +93,6 @@ constexpr float ArmRadius = 0.25f;
 constexpr float MaxShotDist = 150.0f;
 constexpr float MarchStep = 0.25f;
 constexpr int ShotSoundCount = 3;
-constexpr size_t PlaylistMemory = 3;
 constexpr int EnemyHp = 2;
 constexpr float CorpseTime = 12.0f;
 constexpr float StepStride = 1.9f;
@@ -243,7 +247,7 @@ const MapDef Maps[] = {
 };
 constexpr int MapCount = static_cast<int>(std::size(Maps));
 
-enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Lobby };
+enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Lobby, Intro, Loading };
 
 // Set each frame: true while joined to a public lobby, which blocks mods.
 bool gModsLocked = false;
@@ -483,7 +487,6 @@ struct Basis {
 
 struct Playlist {
     std::vector<std::string> tracks;
-    std::vector<int> recent;
     int current = -1;
     Music music{};
     bool loaded = false;
@@ -615,6 +618,7 @@ struct Game {
     Vector3 pos{};
     int money = StartMoney;
     int roundKillMoney = 0;     // combat money earned this wave, kept when the player respawns
+    int economyPlayers = 6;     // players in the match; 6 means base rewards
     int shots = 0;
     int hits = 0;
     int wave = 0;
@@ -658,6 +662,11 @@ struct Game {
     int stock[ThrowCount]{};    // carried throwables: frag, flash, smoke, decoy
     int throwSel = ThrowFrag;
     bool holding = false;       // grenade in hand: shooting is blocked
+    bool knifeOut = false;      // thrown knife is flying or not yet back in hand
+    float knifeBackTimer = 0.0f;  // seconds until the thrown knife returns
+    float knifeLife = 0.0f;     // seconds of flight left, 0 when not flying
+    Vector3 knifePos{};         // thrown knife position
+    Vector3 knifeVel{};         // thrown knife velocity
     float ammoRespawn = AmmoBoxRespawn;
     std::vector<AmmoBox> ammoBoxes;
     std::vector<Chest> chests;
@@ -1041,6 +1050,9 @@ void spawnWave(Game &g) {
         c.opened = false;
     }
     g.grenadeList.clear();
+    g.knifeOut = false;
+    g.knifeLife = 0.0f;
+    g.knifeBackTimer = 0.0f;
     g.blasts.clear();
     g.smokes.clear();
     g.decoys.clear();
@@ -1195,6 +1207,13 @@ void unloadLevel(Level &L) {
     UnloadModel(L.model);
 }
 
+// Rewards are 1.5x with 2 players, 1x with 6, and 0.7x with 12.
+int economyReward(const Game &g, int base) {
+    const float p = static_cast<float>(std::clamp(g.economyPlayers, 2, 12));
+    const float scale = p <= 6.0f ? 1.5f - (p - 2.0f) * 0.125f : 1.0f - (p - 6.0f) * 0.05f;
+    return std::max(1, static_cast<int>(std::lround(static_cast<float>(base) * scale)));
+}
+
 void resetGame(Game &g, int mapIndex) {
     unloadLevel(g.level);
     const bool night = g.night;
@@ -1258,6 +1277,9 @@ void respawnPlayer(Game &g) {
     g.holding = false;
     g.scoped = false;
     g.shopOpen = false;
+    g.knifeOut = false;
+    g.knifeLife = 0.0f;
+    g.knifeBackTimer = 0.0f;
     g.lastHit = "You were killed";
     g.hitTextTimer = 2.0f;
 }
@@ -1703,9 +1725,10 @@ void shoot(Game &g, Audio &a) {
         }
         Enemy &victim = g.enemies[hitIndex];
         ++g.hits;
-        g.money += hit.points;
-        g.roundKillMoney += hit.points;
-        g.lastHit = std::string(hit.name) + " +" + std::to_string(hit.points);
+        const int killReward = economyReward(g, hit.points);
+        g.money += killReward;
+        g.roundKillMoney += killReward;
+        g.lastHit = std::string(hit.name) + " +" + std::to_string(killReward);
         g.hitTextTimer = 1.0f;
         if (victim.netId != 0) {
             // Remote players take damage on their own client; the server relays it and reports deaths.
@@ -1795,8 +1818,30 @@ bool saberHeld(const Game &g) {
     return g.weapon == WeaponKnife && !g.holding && gInv.equipKnife == KnifeLightsaber;
 }
 
+// Applies a knife hit to a hostile: a kill for bots, a hit line online.
+void knifeHit(Game &g, Enemy &victim, const char *label) {
+    if (victim.netId != 0) {
+        g.netOut.push_back(hitLine(victim.netId, PlayerMaxHealth, false, WeaponKnife));
+        ++g.hits;
+        g.lastHit = label;
+        g.hitTextTimer = 1.0f;
+        return;
+    }
+    g.freshKill = true;
+    addKill(g, KillEntry{"You", GOLD, label, botName(victim), teamColor(victim.team), false,
+                         victim.blind > 0.0f,
+                         smoked(g, g.cam.position, Vector3{victim.pos.x, victim.pos.y + 1.0f, victim.pos.z})});
+    victim.hp = 0;
+    ++g.hits;
+    const int knifeReward = economyReward(g, KnifePoints);
+    g.money += knifeReward;
+    g.roundKillMoney += knifeReward;
+    g.lastHit = std::string(label) + " +" + std::to_string(knifeReward);
+    g.hitTextTimer = 1.0f;
+}
+
 void stab(Game &g) {
-    if (g.fireTimer > 0.0f) {
+    if (g.fireTimer > 0.0f || g.knifeOut) {
         return;
     }
     g.fireTimer = KnifeCooldown;
@@ -1819,24 +1864,7 @@ void stab(Game &g) {
     if (best < 0) {
         return;
     }
-    Enemy &victim = g.enemies[static_cast<size_t>(best)];
-    if (victim.netId != 0) {
-        g.netOut.push_back(hitLine(victim.netId, PlayerMaxHealth, false, WeaponKnife));
-        ++g.hits;
-        g.lastHit = "Knife";
-        g.hitTextTimer = 1.0f;
-        return;
-    }
-    g.freshKill = true;
-    addKill(g, KillEntry{"You", GOLD, "Knife", botName(victim), teamColor(victim.team), false,
-                         victim.blind > 0.0f,
-                         smoked(g, g.cam.position, Vector3{victim.pos.x, victim.pos.y + 1.0f, victim.pos.z})});
-    victim.hp = 0;
-    ++g.hits;
-    g.money += KnifePoints;
-    g.roundKillMoney += KnifePoints;
-    g.lastHit = "Knife +" + std::to_string(KnifePoints);
-    g.hitTextTimer = 1.0f;
+    knifeHit(g, g.enemies[static_cast<size_t>(best)], "Knife");
 }
 
 short toPcm(float s) {
@@ -2653,6 +2681,66 @@ void updateLingering(Game &g, Audio &a, float dt) {
                    g.decoys.end());
 }
 
+// Right-click with the knife: throws it along the aim.
+void throwKnife(Game &g) {
+    const Vector3 fwd = forwardOf(g);
+    g.knifeOut = true;
+    g.knifeBackTimer = 0.0f;
+    g.knifePos = Vector3Add(g.cam.position, Vector3Scale(fwd, 0.5f));
+    g.knifeVel = Vector3Scale(fwd, KnifeThrowSpeed);
+    g.knifeLife = KnifeThrowLife;
+    g.kick = 1.0f;
+}
+
+float segmentDist(Vector3 a, Vector3 b, Vector3 p);
+
+// Flies the thrown knife; it lands on walls, the ground or the first hostile it touches, then returns to hand.
+void updateThrownKnife(Game &g, Audio &a, float dt) {
+    if (!playerFrozen(g) && !g.holding && g.weapon == WeaponKnife && !g.knifeOut && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        throwKnife(g);
+    }
+    if (g.knifeLife > 0.0f) {
+        const Vector3 from = g.knifePos;
+        const Vector3 step = Vector3Scale(g.knifeVel, dt);
+        const float len = Vector3Length(step);
+        g.knifeLife -= dt;
+        bool landed = g.knifeLife <= 0.0f;
+        if (len > 0.0f && wallDistAlong(g.level, from, Vector3Scale(step, 1.0f / len), len) < len) {
+            landed = true;
+        }
+        if (!landed) {
+            g.knifePos = Vector3Add(from, step);
+            g.knifeVel.y -= KnifeGravity * dt;
+            if (g.knifePos.y < groundAt(g.level.terrain, g.knifePos.x, g.knifePos.z)) {
+                landed = true;
+            }
+        }
+        if (!landed) {
+            for (Enemy &e : g.enemies) {
+                if (e.hp <= 0 || !hostile(g.localTeam, e.team)) {
+                    continue;
+                }
+                const Vector3 chest{e.pos.x, e.pos.y + 1.0f, e.pos.z};
+                if (segmentDist(from, g.knifePos, chest) < KnifeThrowHit) {
+                    knifeHit(g, e, "Thrown knife");
+                    landed = true;
+                    break;
+                }
+            }
+        }
+        if (landed) {
+            g.knifeLife = 0.0f;
+            g.knifeBackTimer = KnifeReturnTime;
+            playSpatial(g, a, a.crack, g.knifePos, 0.6f, 25.0f);
+        }
+    } else if (g.knifeOut) {
+        g.knifeBackTimer -= dt;
+        if (g.knifeBackTimer <= 0.0f) {
+            g.knifeOut = false;
+        }
+    }
+}
+
 float segmentDist(Vector3 a, Vector3 b, Vector3 p) {
     const Vector3 ab = Vector3Subtract(b, a);
     const float len2 = Vector3DotProduct(ab, ab);
@@ -3146,8 +3234,9 @@ void updateRound(Game &g, Audio &a, float dt) {
         return;
     }
     if (std::none_of(g.enemies.begin(), g.enemies.end(), [](const Enemy &e) { return e.team == TeamRed; })) {
-        g.money += RoundWinMoney;
-        g.lastHit = "Round won +$" + std::to_string(RoundWinMoney);
+        const int roundReward = economyReward(g, RoundWinMoney);
+        g.money += roundReward;
+        g.lastHit = "Round won +$" + std::to_string(roundReward);
         g.hitTextTimer = 2.5f;
         g.intermission = randRange(IntermissionMin, IntermissionMax);
         if (a.ready) {
@@ -3887,6 +3976,7 @@ void update(Game &g, Audio &a, float dt) {
     updateAmmoBoxes(g, dt);
     updateDrops(g);
     updateGrenades(g, a, dt);
+    updateThrownKnife(g, a, dt);
     updateLingering(g, a, dt);
 
     const bool locked = playerFrozen(g);
@@ -4003,33 +4093,14 @@ void loadTrack(Playlist &pl, int index) {
         return;
     }
     pl.current = index;
-    pl.recent.push_back(index);
-    if (pl.recent.size() > PlaylistMemory) {
-        pl.recent.erase(pl.recent.begin());
-    }
     SetMusicVolume(pl.music, pl.muted ? 0.0f : pl.volume);
     PlayMusicStream(pl.music);
 }
 
+// Next track in playlist order, wrapping around to the first.
 int pickNext(const Playlist &pl) {
     const int n = static_cast<int>(pl.tracks.size());
-    std::vector<int> candidates;
-    for (int i = 0; i < n; ++i) {
-        if (std::find(pl.recent.begin(), pl.recent.end(), i) == pl.recent.end()) {
-            candidates.push_back(i);
-        }
-    }
-    if (candidates.empty()) {
-        for (int i = 0; i < n; ++i) {
-            if (i != pl.current) {
-                candidates.push_back(i);
-            }
-        }
-    }
-    if (candidates.empty()) {
-        return pl.current;
-    }
-    return candidates[GetRandomValue(0, static_cast<int>(candidates.size()) - 1)];
+    return n == 0 ? 0 : (pl.current + 1) % n;
 }
 
 void updatePlaylist(Playlist &pl) {
@@ -4123,6 +4194,7 @@ void scanMusic(Playlist &pl, const std::string &dir) {
             pl.tracks.push_back(files.paths[i]);
         }
     }
+    std::sort(pl.tracks.begin(), pl.tracks.end());
     UnloadDirectoryFiles(files);
 }
 
@@ -4555,7 +4627,7 @@ void drawWeapon(const Game &g) {
     gSkinsActive = true;
     if (g.holding) {
         drawThrowParts(g.throwSel);
-    } else {
+    } else if (g.weapon != WeaponKnife || !g.knifeOut) {
         drawWeaponParts(g.weapon, g.muzzleTimer > 0.0f);
     }
     if (saber && g.night) {
@@ -5641,6 +5713,10 @@ void drawGrenadesAndSmoke(const Game &g) {
         DrawSphere(gr.pos, 0.12f, grenadeColor(gr.kind));
     }
     setEmissive(false);
+    if (g.knifeLife > 0.0f) {
+        DrawSphere(g.knifePos, 0.05f, Color{210, 215, 225, 255});
+        DrawLine3D(g.knifePos, Vector3Subtract(g.knifePos, Vector3Scale(g.knifeVel, 0.04f)), Color{200, 220, 255, 255});
+    }
     const bool smokeLit = !gSettings.potato && !g.smokes.empty();
     if (smokeLit) {
         setSmokeUniforms(g);
@@ -6996,6 +7072,7 @@ struct LobbyMenu {
     bool isHost = false;
     bool started = false;
     bool matchReady = false;
+    bool allLoaded = false;      // online: server reports every player has loaded
     bool voting = false;
     MenuState voteMenu;
     std::map<int, int> votes; // fd -> map index
@@ -7246,6 +7323,8 @@ void lobbyHandleLine(LobbyMenu &lm, const std::string &line) {
         if (map >= 0 && map < MapCount) {
             lm.votes[fd] = map;
         }
+    } else if (cmd == "ALL_LOADED") {
+        lm.allLoaded = true;
     } else if (cmd == "MAP_RESULT") {
         int map = -1;
         ss >> map;
@@ -7945,6 +8024,7 @@ void netFrame(Game &g, LobbyMenu &lm, float dt) {
 // Switches a freshly reset game into a shared match with the other lobby players.
 void startOnlineMatch(Game &g, const LobbyMenu &lm) {
     g.online = true;
+    g.economyPlayers = lm.players;
     g.netHost = lm.isHost;
     g.localFd = lm.myFd;
     g.localTeam = lm.myTeam == 1 ? TeamRed : TeamBlue;
@@ -7973,6 +8053,92 @@ void endOnlineMatch(Game &g, LobbyMenu &lm) {
     g.enemies.erase(std::remove_if(g.enemies.begin(), g.enemies.end(),
                                    [](const Enemy &e) { return e.netId != 0; }),
                     g.enemies.end());
+}
+
+constexpr float IntroLoadTime = 2.4f;   // spinning logo before the shot
+constexpr float IntroGapTime = 0.5f;    // blank pause after the shot
+constexpr float IntroOpenTime = 0.9f;   // menu sweep-open duration
+constexpr float IntroFlashTime = 0.3f;  // white flash after the shot
+
+// Spinning logo with a loading bar.
+void drawLoader(float t) {
+    const int W = GetScreenWidth();
+    const int H = GetScreenHeight();
+    const float size = 160.0f;
+    const Rectangle src{0.0f, 0.0f, static_cast<float>(gLogoTex.width), static_cast<float>(gLogoTex.height)};
+    const Rectangle dst{W / 2.0f, H / 2.0f - 40.0f, size, size};
+    DrawTexturePro(gLogoTex, src, dst, Vector2{size / 2.0f, size / 2.0f}, t * 540.0f, WHITE);
+    const char *text = "Loading";
+    DrawText(text, W / 2 - MeasureText(text, 28) / 2, H / 2 + 110, 28, LIGHTGRAY);
+    const float progress = std::clamp(t / IntroLoadTime, 0.0f, 1.0f);
+    DrawRectangle(W / 2 - 150, H / 2 + 150, 300, 6, DARKGRAY);
+    DrawRectangle(W / 2 - 150, H / 2 + 150, static_cast<int>(300.0f * progress), 6, RAYWHITE);
+}
+
+// White flash that fades after the gunshot.
+void drawShotFlash(float since) {
+    const float a = std::clamp(1.0f - since / IntroFlashTime, 0.0f, 1.0f);
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{255, 255, 255, static_cast<unsigned char>(160 * a)});
+}
+
+// Menu revealed by a vertical sweep from the center; p runs 0 to 1.
+void drawMenuOpening(const MenuState &menu, const RenderTexture2D *previews, const Playlist &pl, float p) {
+    const float e = 1.0f - std::pow(1.0f - std::clamp(p, 0.0f, 1.0f), 3.0f);
+    const int W = GetScreenWidth();
+    const int H = GetScreenHeight();
+    const int h = std::max(1, static_cast<int>(H * e));
+    const int y0 = (H - h) / 2;
+    BeginScissorMode(0, y0, W, h);
+    drawMenu(menu, previews, pl);
+    EndScissorMode();
+    const unsigned char edge = static_cast<unsigned char>(255 * (1.0f - e));
+    DrawRectangle(0, y0, W, 4, Color{255, 255, 255, edge});
+    DrawRectangle(0, y0 + h - 4, W, 4, Color{255, 255, 255, edge});
+}
+
+constexpr float LoadLaunchTime = 1.0f;  // shot and zoom-out before the loading view
+constexpr float LoadMinTime = 3.0f;     // spinning map shown at least this long
+constexpr float LoadMaxWait = 20.0f;    // online: start anyway if the server never reports ready
+constexpr float LoadSpinSpeed = 1.0f;   // radians per second
+
+struct MapLoad {
+    int map = 0;
+    float t = 0.0f;
+    float angle = 0.0f;
+    bool online = false;
+    bool shot = false;
+    bool sting = false;
+};
+
+MapLoad makeMapLoad(int map, bool online) {
+    MapLoad l;
+    l.map = map;
+    l.online = online;
+    return l;
+}
+
+// Map zooms out after the shot; then the spinning map with a loading bar.
+void drawMapLoad(const MapLoad &load, const RenderTexture2D &tex, bool waiting) {
+    const int W = GetScreenWidth();
+    const int H = GetScreenHeight();
+    const float baseW = W * 0.55f;
+    const float baseH = baseW * static_cast<float>(tex.texture.height) / static_cast<float>(tex.texture.width);
+    const float e = std::clamp(load.t / LoadLaunchTime, 0.0f, 1.0f);
+    const float zoom = 1.0f + 2.0f * (1.0f - (1.0f - std::pow(1.0f - e, 3.0f)));
+    const float w = baseW * zoom;
+    const float h = baseH * zoom;
+    const Rectangle dst{W / 2.0f - w / 2.0f, H / 2.0f - h / 2.0f - 40.0f, w, h};
+    DrawTexturePro(tex.texture, Rectangle{0.0f, 0.0f, static_cast<float>(tex.texture.width), -static_cast<float>(tex.texture.height)},
+                   dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    if (load.t < LoadLaunchTime) {
+        drawShotFlash(load.t);
+        return;
+    }
+    const char *text = waiting ? "Waiting for other players" : "Loading";
+    DrawText(text, W / 2 - MeasureText(text, 28) / 2, static_cast<int>(H / 2.0f - 40.0f + baseH / 2.0f + 30.0f), 28, LIGHTGRAY);
+    const float progress = waiting ? 1.0f : std::clamp((load.t - LoadLaunchTime) / LoadMinTime, 0.0f, 1.0f);
+    DrawRectangle(W / 2 - 150, H / 2 + 150, 300, 6, DARKGRAY);
+    DrawRectangle(W / 2 - 150, H / 2 + 150, static_cast<int>(300.0f * progress), 6, RAYWHITE);
 }
 
 int main() {
@@ -8037,9 +8203,6 @@ int main() {
 
     scanMusic(audio.playlist, std::string(GetApplicationDirectory()) + "music");
     rebuildMusicFont(audio.playlist);
-    if (!audio.playlist.tracks.empty()) {
-        loadTrack(audio.playlist, pickNext(audio.playlist));
-    }
 
     std::vector<Level> previews(MapCount);
     RenderTexture2D previewTex[MapCount]{};
@@ -8057,7 +8220,11 @@ int main() {
         menu.dirty[i] = true;
     }
 
-    Screen screen = Screen::Menu;
+    Screen screen = Screen::Intro;
+    float introTime = 0.0f;
+    bool introShot = false;
+    bool introOpened = false;
+    MapLoad load;
     Game game;
     gModGame = &game;
     EnableCursor();
@@ -8065,8 +8232,93 @@ int main() {
     while (!WindowShouldClose()) {
         const float dt = GetFrameTime();
         gModsLocked = lobbyMenu.joinedId >= 0 && !lobbyMenu.joinedPrivate;
+
+        if (screen == Screen::Intro) {
+            introTime += dt;
+            if (!introShot && introTime >= IntroLoadTime) {
+                introShot = true;
+                if (audio.ready) {
+                    playAt(audio.shots[WeaponPistol][0], 0.8f, 0.5f);
+                }
+            }
+            const float openStart = IntroLoadTime + IntroGapTime;
+            if (!introOpened && introTime >= openStart) {
+                introOpened = true;
+                if (audio.ready) {
+                    playAt(audio.waveStart, 0.7f, 0.5f);
+                }
+                if (!audio.playlist.tracks.empty()) {
+                    loadTrack(audio.playlist, pickNext(audio.playlist));
+                }
+            }
+            if (introTime >= openStart + IntroOpenTime) {
+                screen = Screen::Menu;
+            }
+
+            for (int i = 0; i < MapCount; ++i) {
+                if (menu.dirty[i]) {
+                    renderPreview(previewTex[i], previews[i], menu.angle[i]);
+                    menu.dirty[i] = false;
+                }
+            }
+
+            BeginDrawing();
+            ClearBackground(Color{20, 22, 35, 255});
+            if (introTime < IntroLoadTime) {
+                drawLoader(introTime);
+            } else if (introTime < openStart) {
+                drawShotFlash(introTime - IntroLoadTime);
+            } else {
+                drawMenuOpening(menu, previewTex, audio.playlist, (introTime - openStart) / IntroOpenTime);
+            }
+            EndDrawing();
+            continue;
+        }
+
         handleMusicKeys(audio.playlist);
         updatePlaylist(audio.playlist);
+
+        if (screen == Screen::Loading) {
+            load.t += dt;
+            if (!load.shot) {
+                load.shot = true;
+                if (audio.ready) {
+                    playAt(audio.shots[WeaponPistol][0], 0.8f, 0.5f);
+                }
+            }
+            if (load.online) {
+                if (!lobbyMenu.conn.isOpen()) {
+                    endOnlineMatch(game, lobbyMenu);
+                    screen = Screen::Menu;
+                    continue;
+                }
+                for (const std::string &line : lobbyMenu.conn.poll()) {
+                    netHandleLine(game, line);
+                    lobbyHandleLine(lobbyMenu, line);
+                }
+            }
+            if (!load.sting && load.t >= LoadLaunchTime) {
+                load.sting = true;
+                if (audio.ready) {
+                    playAt(audio.waveStart, 0.6f, 0.5f);
+                }
+            }
+            load.angle += dt * LoadSpinSpeed;
+            renderPreview(previewTex[load.map], previews[load.map], load.angle);
+
+            const bool minDone = load.t >= LoadLaunchTime + LoadMinTime;
+            const bool othersReady = !load.online || lobbyMenu.allLoaded || load.t >= LoadLaunchTime + LoadMaxWait;
+            if (minDone && othersReady) {
+                DisableCursor();
+                screen = Screen::Playing;
+                continue;
+            }
+            BeginDrawing();
+            ClearBackground(Color{20, 22, 35, 255});
+            drawMapLoad(load, previewTex[load.map], minDone && !othersReady);
+            EndDrawing();
+            continue;
+        }
 
         if (screen == Screen::Menu) {
             if (IsKeyPressed(KEY_Q)) {
@@ -8100,8 +8352,8 @@ int main() {
             const int pick = updateMenu(menu, dt);
             if (pick >= 0) {
                 resetGame(game, pick);
-                DisableCursor();
-                screen = Screen::Playing;
+                load = makeMapLoad(pick, false);
+                screen = Screen::Loading;
                 continue;
             }
 
@@ -8176,11 +8428,14 @@ int main() {
                 lobbyMenu.matchReady = false;
                 gSettings.teamMode = lobbyMenu.joinedId >= 0 ? lobbyMenu.joinedMode == "teams" : lobbyMenu.createTeams;
                 resetGame(game, lobbyMenu.map);
-                if (lobbyMenu.joinedId >= 0) {
+                const bool online = lobbyMenu.joinedId >= 0;
+                if (online) {
                     startOnlineMatch(game, lobbyMenu);
+                    lobbyMenu.allLoaded = false;
+                    lobbyMenu.conn.sendLine("LOADED");
                 }
-                DisableCursor();
-                screen = Screen::Playing;
+                load = makeMapLoad(lobbyMenu.map, online);
+                screen = Screen::Loading;
                 continue;
             }
             BeginDrawing();
