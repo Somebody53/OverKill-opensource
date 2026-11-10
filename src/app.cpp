@@ -176,6 +176,10 @@ constexpr float SmokeSightRange = 25.0f;
 constexpr float DecoyLife = 12.0f;
 constexpr float DecoyBeepTime = 0.6f;
 constexpr float KillFlashTime = 0.8f;
+constexpr float AdrenalineTime = 5.0f;   // seconds of speed boost from the Adrenaline ability
+constexpr float AdrenalineSpeed = 1.35f;
+constexpr float MedkitHeal = 40.0f;
+constexpr float ArmorSurge = 50.0f;
 constexpr float WaveBannerTime = 2.5f;
 constexpr float FuseShort = 1.4f;
 struct Resolution {
@@ -251,7 +255,8 @@ const MapDef Maps[] = {
 };
 constexpr int MapCount = static_cast<int>(std::size(Maps));
 
-enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Lobby, Intro, Loading, Update };
+enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Abilities, Lobby, Intro, Loading, Update };
+constexpr int AbilityKeys[AbilitySlots] = {KEY_Q, KEY_Y, KEY_Z};
 
 // Set each frame: true while joined to a public lobby, which blocks mods.
 bool gModsLocked = false;
@@ -667,6 +672,8 @@ struct Game {
     float health = PlayerMaxHealth;
     float armor = 0.0f;
     int stock[ThrowCount]{};    // carried throwables: frag, flash, smoke, decoy
+    float adrenalineTimer = 0.0f;           // seconds left of the Adrenaline boost
+    float abilityCooldown[AbilitySlots]{};  // seconds left per Q/Y/Z slot
     int throwSel = ThrowFrag;
     bool holding = false;       // grenade in hand: shooting is blocked
     bool knifeOut = false;      // thrown knife is flying or not yet back in hand
@@ -1344,7 +1351,39 @@ void updateCars(Game &g, float dt) {
     }
 }
 
+// Fires the ability in each equipped Q/Y/Z slot when its key is pressed and the slot is ready.
+void updateAbilities(Game &g, float dt) {
+    for (int s = 0; s < AbilitySlots; ++s) {
+        g.abilityCooldown[s] = std::max(0.0f, g.abilityCooldown[s] - dt);
+    }
+    if (playerFrozen(g)) {
+        return;
+    }
+    for (int s = 0; s < AbilitySlots; ++s) {
+        const int a = gInv.equipAbility[s];
+        if (a < 0 || g.abilityCooldown[s] > 0.0f || !IsKeyPressed(AbilityKeys[s])) {
+            continue;
+        }
+        g.abilityCooldown[s] = abilityDefs()[a].cooldown;
+        switch (a) {
+        case AbilityAdrenaline:
+            g.adrenalineTimer = AdrenalineTime;
+            break;
+        case AbilityMedkit:
+            g.health = std::min(PlayerMaxHealth, g.health + MedkitHeal);
+            break;
+        case AbilityArmorSurge:
+            g.armor = std::min(ArmorMax, g.armor + ArmorSurge);
+            break;
+        default:
+            g.reserve += AmmoPackAmount;
+            break;
+        }
+    }
+}
+
 void updatePlayer(Game &g, float dt) {
+    updateAbilities(g, dt);
     const bool crouching = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_C);
     const float targetHeight = crouching ? CrouchHeight : StandHeight;
     g.height += (targetHeight - g.height) * std::min(1.0f, dt * 12.0f);
@@ -1369,6 +1408,9 @@ void updatePlayer(Game &g, float dt) {
     // Light loads run faster; a grenade in hand weighs 0.6 kg.
     const float load = g.holding ? 0.6f : Weapons[g.weapon].weight;
     speed *= std::clamp(1.0f + (2.5f - load) * 0.12f, 0.6f, 1.3f);
+    if (g.adrenalineTimer > 0.0f) {
+        speed *= AdrenalineSpeed;
+    }
 
     g.playerMove = Vector3{0.0f, 0.0f, 0.0f};
     if (!locked && Vector3Length(move) > 0.0f) {
@@ -3979,6 +4021,7 @@ void update(Game &g, Audio &a, float dt) {
     g.shake = std::max(0.0f, g.shake - dt * 2.5f);
     g.flashed = std::max(0.0f, g.flashed - dt);
     g.killFlash = std::max(0.0f, g.killFlash - dt);
+    g.adrenalineTimer = std::max(0.0f, g.adrenalineTimer - dt);
     for (KillEntry &k : g.killFeed) {
         k.age += dt;
     }
@@ -6143,6 +6186,31 @@ void drawChat() {
     }
 }
 
+// Q/Y/Z ability slots at the bottom; a bar drains while the ability recharges.
+void drawAbilityBar(const Game &g) {
+    const int y = GetScreenHeight() - 84;
+    for (int s = 0; s < AbilitySlots; ++s) {
+        const int x = GetScreenWidth() / 2 - 200 + s * 140;
+        const int a = gInv.equipAbility[s];
+        const char key[2] = {static_cast<char>(AbilityKeys[s]), '\0'};
+        DrawRectangle(x, y, 130, 56, Color{20, 22, 35, 180});
+        DrawRectangleLines(x, y, 130, 56, Fade(RAYWHITE, 0.5f));
+        DrawText(key, x + 8, y + 4, 20, YELLOW);
+        if (a < 0) {
+            DrawText("empty", x + 8, y + 30, 16, GRAY);
+            continue;
+        }
+        const AbilityDef &d = abilityDefs()[a];
+        const float cd = g.abilityCooldown[s];
+        if (cd > 0.0f) {
+            DrawText(TextFormat("%.0fs", std::ceil(cd)), x + 8, y + 30, 16, ORANGE);
+            DrawRectangle(x, y + 52, static_cast<int>(130 * cd / d.cooldown), 4, ORANGE);
+        } else {
+            DrawText(d.name, x + 8, y + 30, 16, RAYWHITE);
+        }
+    }
+}
+
 void drawHud(const Game &g, const Playlist &pl) {
     const int acc = g.shots > 0 ? (100 * g.hits) / g.shots : 0;
     DrawText(TextFormat("Map: %s", Maps[g.mapIndex].name), 20, 20, 24, RAYWHITE);
@@ -6208,6 +6276,7 @@ void drawHud(const Game &g, const Playlist &pl) {
         const char *kill = "KILL";
         DrawText(kill, cx - MeasureText(kill, 40) / 2, cy - 70, 40, Fade(RED, std::min(1.0f, g.killFlash / KillFlashTime)));
     }
+    drawAbilityBar(g);
 }
 
 // Red screen edges below LowHealthFrac, a red flash on hit, and blood splats.
@@ -7137,7 +7206,17 @@ bool updateCases(CasesMenu &cm, const Audio &a, float dt) {
     }
     const int gi = listRowUnder(gunListRect(), cm.gunTop, gunRows.size());
     if (gi >= 0) {
-        invSend(cm, "EQUIP_GUN " + std::to_string(weapons[cm.equipSel]) + " " + std::to_string(gunRows[gi]));
+        const int w = weapons[cm.equipSel];
+        const int skin = gunRows[gi];
+        if (invSend(cm, "EQUIP_GUN " + std::to_string(w) + " " + std::to_string(skin)) && skin >= 0) {
+            // A skin sits on one gun only: take it off any other gun.
+            for (int other = 0; other < SkinSlots; ++other) {
+                if (other != w && gInv.equipGun[other] == skin) {
+                    gInv.equipGun[other] = -1;
+                }
+            }
+            gInv.equipGun[w] = skin;
+        }
     }
     const int ki = listRowUnder(knifeListRect(), cm.knifeTop, knifeRows.size());
     if (ki >= 0) {
@@ -7851,6 +7930,111 @@ void drawCases(const CasesMenu &cm) {
     }
 }
 
+// Abilities: buy with Overcoins, then click Q, Y or Z to equip them.
+Rectangle abilitiesButtonRect() {
+    return Rectangle{GetScreenWidth() - 190.0f, 260.0f, 170.0f, 40.0f};
+}
+
+bool abilitiesButtonPressed() {
+    return IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+           CheckCollisionPointRec(GetMousePosition(), abilitiesButtonRect());
+}
+
+void drawAbilitiesButton() {
+    const Rectangle r = abilitiesButtonRect();
+    const bool hot = CheckCollisionPointRec(GetMousePosition(), r);
+    DrawRectangleRec(r, hot ? Color{70, 74, 96, 255} : Color{40, 42, 56, 255});
+    DrawRectangleLinesEx(r, 2.0f, RAYWHITE);
+    const char *label = "Abilities";
+    DrawText(label, static_cast<int>(r.x + r.width / 2) - MeasureText(label, 22) / 2, static_cast<int>(r.y) + 9, 22,
+             RAYWHITE);
+}
+
+Rectangle abilityRowRect(int i) {
+    return Rectangle{GetScreenWidth() / 2.0f - 500.0f, CasesRowY + i * CasesRowH, 1000.0f, 56.0f};
+}
+
+Rectangle abilityBuyRect(int i) {
+    return Rectangle{GetScreenWidth() / 2.0f + 100.0f, CasesRowY + i * CasesRowH + 10.0f, 160.0f, 36.0f};
+}
+
+Rectangle abilitySlotRect(int i, int s) {
+    return Rectangle{GetScreenWidth() / 2.0f + 280.0f + s * 70.0f, CasesRowY + i * CasesRowH + 10.0f, 60.0f, 36.0f};
+}
+
+// Returns true when leaving the abilities screen.
+bool updateAbilityShop(CasesMenu &am) {
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        return true;
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        return false;
+    }
+    const Vector2 m = GetMousePosition();
+    const auto &defs = abilityDefs();
+    for (int i = 0; i < AbilityCount; ++i) {
+        if (CheckCollisionPointRec(m, abilityBuyRect(i))) {
+            if (gInv.ability[i]) {
+                am.result = "Already owned";
+                am.resultColor = WarnColor;
+            } else if (gInv.coins < defs[i].price) {
+                am.result = "Not enough Overcoins";
+                am.resultColor = WarnColor;
+            } else if (invSend(am, "BUY_ABIL " + std::to_string(i))) {
+                am.result = std::string("Buying ") + defs[i].name + "...";
+                am.resultColor = RAYWHITE;
+            }
+            return false;
+        }
+        for (int s = 0; s < AbilitySlots; ++s) {
+            if (!CheckCollisionPointRec(m, abilitySlotRect(i, s))) {
+                continue;
+            }
+            if (!gInv.ability[i]) {
+                am.result = "Buy the ability first";
+                am.resultColor = WarnColor;
+            } else {
+                // Clicking the ability already in this slot clears the slot.
+                const int want = gInv.equipAbility[s] == i ? -1 : i;
+                invSend(am, "EQUIP_ABIL " + std::to_string(s) + " " + std::to_string(want));
+            }
+            return false;
+        }
+    }
+    return CheckCollisionPointRec(m, casesBackRect());
+}
+
+void drawAbilityShop(const CasesMenu &am) {
+    const int W = GetScreenWidth();
+    const char *title = "Abilities";
+    DrawText(title, W / 2 - MeasureText(title, 48) / 2, 28, 48, RAYWHITE);
+    DrawText(TextFormat("Overcoins: %d", gInv.coins), 24, 24, 26, YELLOW);
+    const char *tip = "Buy once, then equip to Q, Y or Z   Esc: back (saved)";
+    DrawText(tip, W - 24 - MeasureText(tip, 18), 34, 18, GRAY);
+
+    const auto &defs = abilityDefs();
+    for (int i = 0; i < AbilityCount; ++i) {
+        const Rectangle r = abilityRowRect(i);
+        DrawRectangleRec(r, Color{40, 42, 56, 255});
+        DrawText(defs[i].name, static_cast<int>(r.x) + 16, static_cast<int>(r.y) + 6, 24, RAYWHITE);
+        DrawText(TextFormat("%s   Cooldown %.0fs", defs[i].desc, defs[i].cooldown), static_cast<int>(r.x) + 16,
+                 static_cast<int>(r.y) + 34, 18, LIGHTGRAY);
+        const bool owned = gInv.ability[i];
+        const std::string buyLabel = owned ? std::string("Owned") : "Buy " + std::to_string(defs[i].price);
+        drawButton(abilityBuyRect(i), buyLabel.c_str(), !owned);
+        for (int s = 0; s < AbilitySlots; ++s) {
+            const Rectangle slot = abilitySlotRect(i, s);
+            const char key[2] = {static_cast<char>(AbilityKeys[s]), '\0'};
+            drawButton(slot, key, owned);
+            if (gInv.equipAbility[s] == i) {
+                DrawRectangleLinesEx(slot, 3.0f, YELLOW);
+            }
+        }
+    }
+    DrawText(am.result.c_str(), W / 2 - MeasureText(am.result.c_str(), 22) / 2, 384, 22, am.resultColor);
+    drawButton(casesBackRect(), "Back", true);
+}
+
 void drawMapCards(const MenuState &menu, const RenderTexture2D *previews) {
     for (int i = 0; i < MapCount; ++i) {
         if (!cardVisible(i, menu.scroll)) {
@@ -8041,6 +8225,7 @@ void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Play
     drawSettingsButton();
     drawModsButton();
     drawCasesButton();
+    drawAbilitiesButton();
     drawLobbyMenuButton();
     drawUpdateButton();
 }
@@ -8603,6 +8788,7 @@ int main() {
     ModsState modState;
     AvatarMenu avatarMenu;
     CasesMenu casesMenu;
+    CasesMenu abilityMenu;
     LobbyMenu lobbyMenu;
     UpdateScreen upd;
     lobbyMenu.fields[LobbyAddress] = gServerAddress;
@@ -8741,6 +8927,12 @@ int main() {
                 screen = Screen::Cases;
                 continue;
             }
+            if (abilitiesButtonPressed()) {
+                abilityMenu = CasesMenu{};
+                requestInventory();
+                screen = Screen::Abilities;
+                continue;
+            }
             if (lobbyMenuButtonPressed()) {
                 screen = Screen::Lobby;
                 continue;
@@ -8805,6 +8997,18 @@ int main() {
             BeginDrawing();
             ClearBackground(Color{20, 22, 35, 255});
             drawAvatar(avatarMenu);
+            EndDrawing();
+            continue;
+        }
+
+        if (screen == Screen::Abilities) {
+            if (updateAbilityShop(abilityMenu)) {
+                screen = Screen::Menu;
+                continue;
+            }
+            BeginDrawing();
+            ClearBackground(Color{20, 22, 35, 255});
+            drawAbilityShop(abilityMenu);
             EndDrawing();
             continue;
         }

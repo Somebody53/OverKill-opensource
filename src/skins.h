@@ -20,6 +20,9 @@ constexpr int KnifeSkinCount = 7;
 constexpr int KnifeLightsaber = 6;
 constexpr int CaseCount = 4;
 constexpr int SkinSlots = 32;  // equip slots, indexed by the Weapon enum (21 weapons today)
+constexpr int AbilityCount = 4;
+constexpr int AbilitySlots = 3;  // equipped abilities, bound to Q, Y and Z
+enum Ability { AbilityAdrenaline, AbilityMedkit, AbilityArmorSurge, AbilityResupply };
 
 inline const char *rarityName(Rarity r) {
     static const char *const names[RarityCount] = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Knife"};
@@ -111,6 +114,24 @@ inline const std::array<CaseDef, CaseCount> &caseDefs() {
     return defs;
 }
 
+// Abilities are bought with Overcoins and used in play with Q, Y or Z once equipped.
+struct AbilityDef {
+    const char *name;
+    int price;     // Overcoins, one-time purchase
+    float cooldown;  // seconds between uses
+    const char *desc;
+};
+
+inline const std::array<AbilityDef, AbilityCount> &abilityDefs() {
+    static const std::array<AbilityDef, AbilityCount> defs = {{
+        {"Adrenaline", 1600, 20.0f, "Speed boost for 5 seconds"},
+        {"Medkit", 1200, 25.0f, "Heal 40 health"},
+        {"Armor Surge", 1400, 30.0f, "Gain 50 armor"},
+        {"Resupply", 1000, 35.0f, "Add 60 reserve ammo"},
+    }};
+    return defs;
+}
+
 // Maps a roll in [0, 100) onto a rarity using the case weights.
 inline Rarity rarityFromRoll(const CaseDef &c, int roll) {
     int acc = 0;
@@ -133,9 +154,12 @@ struct Inventory {
     int equipGun[SkinSlots];  // skin index per weapon, -1 for the default look
     int equipKnife = -1;
     bool adminSign = false;   // granted by the server to customIds listed in admins.txt
+    bool ability[AbilityCount]{};       // bought abilities
+    int equipAbility[AbilitySlots];     // ability index per Q/Y/Z slot, -1 for empty
 
     Inventory() {
         std::fill(std::begin(equipGun), std::end(equipGun), -1);
+        std::fill(std::begin(equipAbility), std::end(equipAbility), -1);
     }
 };
 
@@ -165,6 +189,15 @@ inline void inventoryFromText(Inventory &inv, const std::string &text) {
             }
         } else if (key == "equipKnife") {
             inv.equipKnife = std::clamp(num, -1, KnifeSkinCount - 1);
+        } else if (key == "abil") {
+            for (size_t i = 0; i < AbilityCount && i < val.size(); ++i) {
+                inv.ability[i] = val[i] == '1';
+            }
+        } else if (key.compare(0, 9, "equipAbil") == 0) {
+            const int s = std::atoi(key.c_str() + 9);
+            if (s >= 0 && s < AbilitySlots) {
+                inv.equipAbility[s] = std::clamp(num, -1, AbilityCount - 1);
+            }
         } else if (key == "adminSign") {
             inv.adminSign = num != 0;
         } else if (key.compare(0, 3, "box") == 0) {
