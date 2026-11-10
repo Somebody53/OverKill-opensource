@@ -9,6 +9,8 @@
 #include "skins.h"
 #include "lobby_net.h"
 #include "server_lookup.h"
+#include <memory>
+#include <set>
 #include <sstream>
 
 // C interface of src/ai_rs (Rust enemy brain). Field order matches the Rust #[repr(C)] structs.
@@ -386,16 +388,17 @@ std::string gServerAddress = "127.0.0.1:7777";
 std::string gPlayerCustomId;
 std::future<ServerLookup> gServerLookup;
 
-// Overcoins, boxes, keys and owned skins. Saved to inventory.cfg.
+// Overcoins, boxes, keys and owned skins. The game server owns this data; the client keeps its last reply.
 Inventory gInv;
+// Lobby fds of the players the server marked with the admin sign.
+std::set<int> gAdminFds;
 
-std::string inventoryFilePath() {
-    return std::string(GetApplicationDirectory()) + "inventory.cfg";
-}
-
-void persistInventory() {
-    saveInventory(gInv, inventoryFilePath());
-}
+// Inventory connection to the game server (cases, skins and kill rewards).
+std::unique_ptr<LobbyConnection> gInvConn;
+std::future<std::unique_ptr<LobbyConnection>> gInvConnect;
+double gInvRetryAt = 0.0;
+constexpr double InvRetrySeconds = 10.0;
+int gOpeningCase = 0;  // case shown in the current drop reel
 
 struct Enemy {
     Vector3 pos;
@@ -727,10 +730,6 @@ std::string botName(const Enemy &e) {
 }
 
 void addKill(Game &g, KillEntry k) {
-    if (k.killer == "You") {
-        gInv.coins += k.headshot ? 3 : 1;
-        persistInventory();
-    }
     g.killFeed.push_back(k);
     if (g.killFeed.size() > KillFeedMax) {
         g.killFeed.erase(g.killFeed.begin());
@@ -5099,6 +5098,11 @@ void drawEnemyBars(const Game &g) {
         const float frac = e.netId != 0 ? e.netHealth : static_cast<float>(e.hp) / EnemyHp;
         DrawRectangle(static_cast<int>(x), static_cast<int>(s.y), static_cast<int>(w * frac),
                       static_cast<int>(h), frac > 0.5f ? GREEN : RED);
+        if (e.netId != 0 && gAdminFds.count(e.netId)) {
+            const char *tag = "ADMIN";
+            const int tagW = MeasureText(tag, 14);
+            DrawText(tag, static_cast<int>(s.x - tagW / 2.0f), static_cast<int>(s.y) - 18, 14, Color{255, 200, 40, 255});
+        }
     }
 }
 
@@ -6970,6 +6974,44 @@ int listRowUnder(Rectangle area, int top, size_t rows) {
     return (i >= 0 && i < static_cast<int>(rows)) ? i : -1;
 }
 
+// Sends a command to the game server. Shows an error when the inventory connection is down.
+bool invSend(CasesMenu &cm, const std::string &line) {
+    if (gInvConn && gInvConn->isOpen()) {
+        gInvConn->sendLine(line);
+        return true;
+    }
+    cm.result = "Not connected to the game server";
+    cm.resultColor = WarnColor;
+    return false;
+}
+
+// Asks the server for the current inventory (coins, owned skins, equips).
+void requestInventory() {
+    if (gInvConn && gInvConn->isOpen()) {
+        gInvConn->sendLine("GET");
+    }
+}
+
+// Starts the reel that lands on the drop the server chose.
+void startDropReel(CasesMenu &cm, bool knife, int idx) {
+    const std::vector<Skin> &pool = knife ? knifeSkins() : gunSkins();
+    if (idx < 0 || idx >= static_cast<int>(pool.size())) {
+        return;
+    }
+    const Skin &drop = pool[idx];
+    cm.result = std::string("Opened ") + caseDefs()[gOpeningCase].name + ": " + drop.name + " (" +
+                rarityName(drop.rarity) + ")";
+    cm.resultColor = rarityColor(drop.rarity);
+    cm.spin = Spin{};
+    cm.spin.active = true;
+    cm.spin.target = SpinWinPos + GetRandomValue(-30, 30) / 100.0f;
+    cm.spin.strip.resize(SpinStripLen);
+    for (const Skin *&slot : cm.spin.strip) {
+        slot = &pool[GetRandomValue(0, static_cast<int>(pool.size()) - 1)];
+    }
+    cm.spin.strip[SpinWinPos] = &drop;
+}
+
 void buyItem(CasesMenu &cm, int c, bool key) {
     const CaseDef &def = caseDefs()[c];
     const int price = key ? def.keyPrice : def.price;
@@ -6978,53 +7020,26 @@ void buyItem(CasesMenu &cm, int c, bool key) {
         cm.resultColor = WarnColor;
         return;
     }
-    gInv.coins -= price;
-    if (key) {
-        gInv.keys[c]++;
-    } else {
-        gInv.boxes[c]++;
+    if (!invSend(cm, "BUY " + std::to_string(c) + (key ? " key" : " box"))) {
+        return;
     }
-    cm.result = std::string("Bought ") + def.name + (key ? " key" : " box");
+    cm.result = std::string("Buying ") + def.name + (key ? " key" : " box") + "...";
     cm.resultColor = RAYWHITE;
-    persistInventory();
 }
 
-// Uses one box and one key; the drop goes into the inventory.
+// Uses one box and one key. The server rolls the drop and the reel starts when it replies.
 void openCase(CasesMenu &cm, int c) {
-    const CaseDef &def = caseDefs()[c];
     if (gInv.boxes[c] <= 0 || gInv.keys[c] <= 0) {
         cm.result = "You need a box and a key";
         cm.resultColor = WarnColor;
         return;
     }
-    gInv.boxes[c]--;
-    gInv.keys[c]--;
-    const Rarity rar = rarityFromRoll(def, GetRandomValue(0, 99));
-    const bool knife = rar == Rarity::Knife;
-    const std::vector<Skin> &pool = knife ? knifeSkins() : gunSkins();
-    std::vector<int> matches;
-    for (int i = 0; i < static_cast<int>(pool.size()); ++i) {
-        if (pool[i].rarity == rar && !(knife && i == KnifeLightsaber)) {
-            matches.push_back(i);
-        }
+    if (!invSend(cm, "OPEN " + std::to_string(c))) {
+        return;
     }
-    const int idx = matches[GetRandomValue(0, static_cast<int>(matches.size()) - 1)];
-    if (knife) {
-        gInv.knife[idx] = true;
-    } else {
-        gInv.gun[idx] = true;
-    }
-    cm.result = std::string("Opened ") + def.name + ": " + pool[idx].name + " (" + rarityName(rar) + ")";
-    cm.resultColor = rarityColor(rar);
-    cm.spin = Spin{};
-    cm.spin.active = true;
-    cm.spin.target = SpinWinPos + GetRandomValue(-30, 30) / 100.0f;
-    cm.spin.strip.resize(SpinStripLen);
-    for (const Skin *&slot : cm.spin.strip) {
-        slot = &pool[GetRandomValue(0, static_cast<int>(pool.size()) - 1)];
-    }
-    cm.spin.strip[SpinWinPos] = &pool[idx];
-    persistInventory();
+    gOpeningCase = c;
+    cm.result = "Opening...";
+    cm.resultColor = RAYWHITE;
 }
 
 // Advances the case reel, clicking each time a card passes the marker.
@@ -7097,13 +7112,11 @@ bool updateCases(CasesMenu &cm, const Audio &a, float dt) {
     }
     const int gi = listRowUnder(gunListRect(), cm.gunTop, gunRows.size());
     if (gi >= 0) {
-        gInv.equipGun[weapons[cm.equipSel]] = gunRows[gi];
-        persistInventory();
+        invSend(cm, "EQUIP_GUN " + std::to_string(weapons[cm.equipSel]) + " " + std::to_string(gunRows[gi]));
     }
     const int ki = listRowUnder(knifeListRect(), cm.knifeTop, knifeRows.size());
     if (ki >= 0) {
-        gInv.equipKnife = knifeRows[ki];
-        persistInventory();
+        invSend(cm, "EQUIP_KNIFE " + std::to_string(knifeRows[ki]));
     }
     return CheckCollisionPointRec(m, casesBackRect());
 }
@@ -7258,6 +7271,8 @@ void lobbyConnect(LobbyMenu &lm) {
     }
     lm.outdated = false;
     lm.conn.sendLine(std::string("HELLO ") + GameVersion);
+    lm.conn.sendLine("ID " + gPlayerCustomId + " " + gPlayerName);
+    gAdminFds.clear();
     // Connect time is used as the ping estimate.
     lm.pingMs = static_cast<int>((GetTime() - start) * 1000.0);
     gServerAddress = lm.fields[LobbyAddress];
@@ -7349,6 +7364,7 @@ void lobbyHandleLine(LobbyMenu &lm, const std::string &line) {
             lm.started = false;
             lm.players = 0;
             lm.status = "Left the lobby";
+            gAdminFds.clear();
         }
         lm.pendingMode.clear();
         lm.pendingCreate = false;
@@ -7375,6 +7391,10 @@ void lobbyHandleLine(LobbyMenu &lm, const std::string &line) {
         }
     } else if (cmd == "YOU") {
         ss >> lm.myFd;
+    } else if (cmd == "ADMIN") {
+        int fd = -1;
+        ss >> fd;
+        gAdminFds.insert(fd);
     } else if (cmd == "TEAM") {
         ss >> lm.myTeam;
     } else if (cmd == "VOTE_START") {
@@ -7444,6 +7464,80 @@ void startServerLookup(LobbyMenu &lm) {
     }
     gServerLookup = std::async(std::launch::async, lookupServerAddress, gPlayerCustomId);
     lm.status = "Searching PlayFab for the server address...";
+}
+
+// Opens the inventory connection and asks for the account. Runs on a background thread.
+std::unique_ptr<LobbyConnection> connectInventory(std::string address, std::string id) {
+    auto conn = std::make_unique<LobbyConnection>();
+    std::string err;
+    if (!conn->open(address, err)) {
+        return nullptr;
+    }
+    conn->sendLine(std::string("HELLO ") + GameVersion);
+    conn->sendLine("ID " + id + " " + gPlayerName);
+    conn->sendLine("GET");
+    return conn;
+}
+
+std::string invErrorText(const std::string &code) {
+    if (code == "no_coins") return "Not enough Overcoins";
+    if (code == "no_box_or_key") return "You need a box and a key";
+    if (code == "bad_equip") return "You do not own that skin";
+    if (code == "not_identified") return "The server does not know your player ID";
+    return "Server error: " + code;
+}
+
+// Applies one line from the game server's inventory connection.
+void handleInvLine(CasesMenu &cm, const std::string &line) {
+    std::istringstream ss(line);
+    std::string cmd;
+    ss >> cmd;
+    if (cmd == "INV") {
+        std::string text;
+        std::getline(ss, text);
+        if (!text.empty() && text[0] == ' ') {
+            text.erase(0, 1);
+        }
+        gInv = Inventory{};
+        inventoryFromText(gInv, text);
+    } else if (cmd == "DROP") {
+        std::string kind;
+        int idx = -1;
+        ss >> kind >> idx;
+        startDropReel(cm, kind == "knife", idx);
+    } else if (cmd == "ERR") {
+        std::string code;
+        ss >> code;
+        cm.result = invErrorText(code);
+        cm.resultColor = WarnColor;
+    }
+}
+
+// Keeps the inventory connection alive and applies its replies. Call every frame.
+void updateInventory(LobbyMenu &lm, CasesMenu &cm) {
+    applyServerLookup(lm);
+    if (gInvConn) {
+        for (const std::string &line : gInvConn->poll()) {
+            handleInvLine(cm, line);
+        }
+        if (!gInvConn->isOpen()) {
+            gInvConn.reset();
+            gInvRetryAt = GetTime() + InvRetrySeconds;
+        }
+    }
+    if (gInvConnect.valid() &&
+        gInvConnect.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        std::unique_ptr<LobbyConnection> conn = gInvConnect.get();
+        if (conn) {
+            gInvConn = std::move(conn);
+        } else {
+            gInvRetryAt = GetTime() + InvRetrySeconds;
+        }
+    }
+    if (!gInvConn && !gInvConnect.valid() && !gServerAddress.empty() && !gPlayerCustomId.empty() &&
+        GetTime() >= gInvRetryAt) {
+        gInvConnect = std::async(std::launch::async, connectInventory, gServerAddress, gPlayerCustomId);
+    }
 }
 
 // Returns true when the player leaves the lobby screen.
@@ -7759,6 +7853,8 @@ void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Play
     DrawText(hint, GetScreenWidth() / 2 - MeasureText(hint, 18) / 2, H - 30, 18, GRAY);
     const char *music = "Left/Right: track   Up/Down: volume   M: mute   P: play/pause";
     DrawText(music, GetScreenWidth() / 2 - MeasureText(music, 18) / 2, H - 52, 18, GRAY);
+    const char *version = TextFormat("v%s", GameVersion);
+    DrawText(version, GetScreenWidth() - MeasureText(version, 18) - 12, H - 30, 18, GRAY);
     drawMusicInfo(pl);
     drawSettingsButton();
     drawModsButton();
@@ -7823,33 +7919,16 @@ int modGetCoins() {
     return gInv.coins;
 }
 
-void modSetCoins(int coins) {
-    if (gInv.coins != coins) {
-        gInv.coins = std::max(0, coins);
-        persistInventory();
-    }
-}
+// Mods cannot change the inventory; the game server owns it. These hooks only read or do nothing.
+void modSetCoins(int) {}
 
-// Unlocks every knife except the lightsaber, which only the lightsaber mod can grant.
-void modUnlockKnives() {
-    for (int i = 0; i < KnifeSkinCount; ++i) {
-        if (i != KnifeLightsaber) {
-            gInv.knife[i] = true;
-        }
-    }
-    persistInventory();
-}
+void modUnlockKnives() {}
 
 int modKnifeOwned(int index) {
     return index >= 0 && index < KnifeSkinCount && gInv.knife[index] ? 1 : 0;
 }
 
-void modUnlockKnife(int index) {
-    if (index >= 0 && index < KnifeSkinCount && !gInv.knife[index]) {
-        gInv.knife[index] = true;
-        persistInventory();
-    }
-}
+void modUnlockKnife(int) {}
 
 void modHeal(float amount) {
     if (gModGame) {
@@ -8284,7 +8363,6 @@ int main() {
         saveSettings();
     }
     gServerLookup = std::async(std::launch::async, lookupServerAddress, gPlayerCustomId);
-    loadInventory(gInv, inventoryFilePath());
     applyDisplay();
     initGraphics();
     SetTargetFPS(60);
@@ -8363,6 +8441,7 @@ int main() {
     while (!WindowShouldClose()) {
         const float dt = GetFrameTime();
         gModsLocked = lobbyMenu.joinedId >= 0 && !lobbyMenu.joinedPrivate;
+        updateInventory(lobbyMenu, casesMenu);
 
         if (screen == Screen::Intro) {
             introTime += dt;
@@ -8455,7 +8534,6 @@ int main() {
 
         if (screen == Screen::Menu) {
             if (IsKeyPressed(KEY_Q)) {
-                saveInventory(gInv, inventoryFilePath());
                 break;
             }
             if (settingsButtonPressed()) {
@@ -8475,6 +8553,7 @@ int main() {
             }
             if (casesButtonPressed()) {
                 casesMenu = CasesMenu{};
+                requestInventory();
                 screen = Screen::Cases;
                 continue;
             }
@@ -8527,7 +8606,6 @@ int main() {
 
         if (screen == Screen::Cases) {
             if (updateCases(casesMenu, audio, dt)) {
-                saveInventory(gInv, inventoryFilePath());
                 screen = Screen::Menu;
                 continue;
             }
@@ -8605,7 +8683,7 @@ int main() {
             game.shopOpen = false;
             DisableCursor();
         } else if (!chatting && IsKeyPressed(KEY_ESCAPE)) {
-            saveInventory(gInv, inventoryFilePath());
+            requestInventory();
             EnableCursor();
             setMusicPaused(audio.playlist, false);
             if (audio.ready) {

@@ -121,6 +121,26 @@ bool postJson(const std::string &host, const std::string &path, const std::strin
 
 #endif
 
+std::string playFabHost() {
+    return std::string(PlayFabTitleId) + ".playfabapi.com";
+}
+
+// Logs in with the custom ID and returns the session ticket.
+bool playFabLogin(const std::string &customId, std::string &ticket, std::string &error) {
+    const std::string loginBody = std::string("{\"TitleId\":\"") + PlayFabTitleId + "\",\"CustomId\":\"" +
+                                  customId + "\",\"CreateAccount\":true}";
+    std::string response;
+    if (!postJson(playFabHost(), "/Client/LoginWithCustomID", loginBody, "", response, error)) {
+        return false;
+    }
+    ticket = jsonStringField(response, "SessionTicket");
+    if (ticket.empty()) {
+        error = "PlayFab login failed";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 std::string makeCustomId() {
@@ -136,23 +156,14 @@ std::string makeCustomId() {
 
 ServerLookup lookupServerAddress(const std::string &customId) {
     ServerLookup result;
-    const std::string host = std::string(PlayFabTitleId) + ".playfabapi.com";
+    std::string ticket;
+    if (!playFabLogin(customId, ticket, result.error)) {
+        return result;
+    }
 
-    const std::string loginBody = std::string("{\"TitleId\":\"") + PlayFabTitleId + "\",\"CustomId\":\"" +
-                                  customId + "\",\"CreateAccount\":true}";
     std::string response;
-    if (!postJson(host, "/Client/LoginWithCustomID", loginBody, "", response, result.error)) {
-        return result;
-    }
-    const std::string ticket = jsonStringField(response, "SessionTicket");
-    if (ticket.empty()) {
-        result.error = "PlayFab login failed";
-        return result;
-    }
-
-    response.clear();
     const std::string dataBody = std::string("{\"Keys\":[\"") + PlayFabTitleDataKey + "\"]}";
-    if (!postJson(host, "/Client/GetTitleData", dataBody, ticket, response, result.error)) {
+    if (!postJson(playFabHost(), "/Client/GetTitleData", dataBody, ticket, response, result.error)) {
         return result;
     }
     const std::string address = jsonStringField(response, PlayFabTitleDataKey);
@@ -165,3 +176,4 @@ ServerLookup lookupServerAddress(const std::string &customId) {
     result.address = address;
     return result;
 }
+

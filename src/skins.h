@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
-#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -123,7 +123,7 @@ inline Rarity rarityFromRoll(const CaseDef &c, int roll) {
     return Rarity::Common;
 }
 
-// The player's economy. Saved to inventory.cfg next to the executable.
+// The player's economy. Owned by the game server; the client only holds a copy received from it.
 struct Inventory {
     int coins = 0;
     int boxes[CaseCount]{};
@@ -132,35 +132,18 @@ struct Inventory {
     bool knife[KnifeSkinCount]{};
     int equipGun[SkinSlots];  // skin index per weapon, -1 for the default look
     int equipKnife = -1;
+    bool adminSign = false;   // granted by the server to customIds listed in admins.txt
 
     Inventory() {
         std::fill(std::begin(equipGun), std::end(equipGun), -1);
     }
 };
 
-inline void saveInventory(const Inventory &inv, const std::string &path) {
-    std::ofstream out(path);
-    out << "coins=" << inv.coins << '\n';
-    for (int c = 0; c < CaseCount; ++c) {
-        out << "box" << c << '=' << inv.boxes[c] << '\n';
-        out << "key" << c << '=' << inv.keys[c] << '\n';
-    }
-    out << "gun=";
-    for (bool b : inv.gun) {
-        out << (b ? '1' : '0');
-    }
-    out << "\nknife=";
-    for (bool b : inv.knife) {
-        out << (b ? '1' : '0');
-    }
-    out << "\nequipKnife=" << inv.equipKnife << '\n';
-    for (int w = 0; w < SkinSlots; ++w) {
-        out << "equip" << w << '=' << inv.equipGun[w] << '\n';
-    }
-}
-
-inline void loadInventory(Inventory &inv, const std::string &path) {
-    std::ifstream in(path);
+// Parses the server's INV payload, where '|' stands in for newlines.
+inline void inventoryFromText(Inventory &inv, const std::string &text) {
+    std::string normalized = text;
+    std::replace(normalized.begin(), normalized.end(), '|', '\n');
+    std::istringstream in(normalized);
     std::string line;
     while (std::getline(in, line)) {
         const size_t eq = line.find('=');
@@ -182,6 +165,8 @@ inline void loadInventory(Inventory &inv, const std::string &path) {
             }
         } else if (key == "equipKnife") {
             inv.equipKnife = std::clamp(num, -1, KnifeSkinCount - 1);
+        } else if (key == "adminSign") {
+            inv.adminSign = num != 0;
         } else if (key.compare(0, 3, "box") == 0) {
             const int c = std::atoi(key.c_str() + 3);
             if (c >= 0 && c < CaseCount) {
