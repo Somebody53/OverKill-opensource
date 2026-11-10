@@ -190,6 +190,14 @@ try {
     if (-not $mk) { Fail 'no Makefile in the downloaded source' }
     Set-Location -LiteralPath $mk.DirectoryName
 
+    $raylibSrc = Join-Path $mk.DirectoryName 'third_party\raylib-5.5'
+    if (-not (Test-Path (Join-Path $raylibSrc 'src\raylib.h'))) { Fail 'raylib sources were not found in the downloaded source' }
+    $raylibCopy = Join-Path $mk.DirectoryName 'build\windows\raylib-5.5'
+    New-Item -ItemType Directory -Force -Path (Split-Path $raylibCopy) | Out-Null
+    if (Test-Path $raylibCopy) { Remove-Item -LiteralPath $raylibCopy -Recurse -Force }
+    Copy-Item -LiteralPath $raylibSrc -Destination $raylibCopy -Recurse -Force
+    if (-not (Test-Path (Join-Path $raylibCopy 'src\raylib.h'))) { Fail 'the raylib copy for Windows could not be created' }
+
     $cfg = @('WIN_CXX=g++', 'WIN_CC=gcc', 'WIN_AR=ar')
     $goals = @('windows', 'mods')
     $dry = & make -n @cfg @goals 2>$null

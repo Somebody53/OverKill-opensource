@@ -87,8 +87,7 @@ WIN_LDLIBS     := -lopengl32 -lgdi32 -lwinmm -lws2_32 -lpthread -luserenv -lbcry
 # Windows cross-build (mingw-w64). Raylib is built from a copy so the Linux objects are untouched.
 $(WIN_RAYLIB_LIB): $(RAYLIB_DIR)/src/raylib.h
 	mkdir -p $(WIN_DIR)
-	rm -rf $(WIN_RAYLIB_DIR)
-	cp -r $(RAYLIB_DIR) $(WIN_RAYLIB_DIR)
+	if [ ! -f $(WIN_RAYLIB_DIR)/src/raylib.h ]; then rm -rf $(WIN_RAYLIB_DIR) && cp -r $(RAYLIB_DIR) $(WIN_RAYLIB_DIR); fi
 	-$(MAKE) -C $(WIN_RAYLIB_DIR)/src clean
 	$(MAKE) -C $(WIN_RAYLIB_DIR)/src PLATFORM=PLATFORM_DESKTOP PLATFORM_OS=WINDOWS RAYLIB_LIBTYPE=STATIC CC=$(WIN_CC) AR=$(WIN_AR)
 	cp $(WIN_RAYLIB_DIR)/src/libraylib.a $@
