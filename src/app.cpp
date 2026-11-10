@@ -82,6 +82,7 @@ constexpr float KnifeThrowHit = 0.35f;   // hit radius around a target's chest
 constexpr float KnifeReturnTime = 0.8f;  // seconds after landing until the knife is back in hand
 constexpr float BaseFov = 70.0f;
 constexpr float ScopeFov = 18.0f;
+constexpr float AimFov = 50.0f;
 constexpr float TracerTime = 0.05f;
 constexpr float MuzzleTime = 0.04f;
 constexpr float FireTime = 0.09f;
@@ -333,6 +334,11 @@ constexpr WeaponDef Weapons[WeaponCount] = {
     {"M249", 5200, 100, 4.5f, true, 0.1f, 0.1f, 1, 8.0f, 0.05f, 7.0f, false},
     {"Taser", 0, 1, 1.8f, false, 0.0f, 1.2f, 0, 0.0f, 0.0f, 0.5f, false},
 };
+
+// Guns can aim down sights; the knife and taser cannot.
+bool aimable(int w) {
+    return w != WeaponKnife && w != WeaponTaser;
+}
 
 // Weapons shown in the buy menu (pistol and knife are free and always owned).
 constexpr int ShopItems[] = {WeaponDeagle, WeaponGlock,  WeaponUsp,   WeaponP250,  WeaponFiveSeven, WeaponRevolver,
@@ -4027,11 +4033,11 @@ void update(Game &g, Audio &a, float dt) {
     }
     g.cam.target = Vector3Add(g.cam.position, forwardOf(g));
 
-    // Scope only stays on while a scoped rifle is out and the player is free to act.
-    if (playerFrozen(g) || g.holding || !Weapons[g.weapon].scope) {
+    // Aim stays on while a gun is out and the player is free to act.
+    if (playerFrozen(g) || g.holding || !aimable(g.weapon)) {
         g.scoped = false;
     }
-    const float fovTarget = g.scoped ? ScopeFov : BaseFov;
+    const float fovTarget = g.scoped ? (Weapons[g.weapon].scope ? ScopeFov : AimFov) : BaseFov;
     g.cam.fovy += (fovTarget - g.cam.fovy) * std::min(1.0f, dt * 14.0f);
 
     g.fireTimer = std::max(0.0f, g.fireTimer - dt);
@@ -4093,7 +4099,7 @@ void update(Game &g, Audio &a, float dt) {
             g.holding = false;
             announceHeld(g);
         }
-        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && Weapons[g.weapon].scope && !g.holding) {
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && aimable(g.weapon) && !g.holding) {
             g.scoped = !g.scoped;
         }
         if (g.weapon == WeaponTaser) {
@@ -4718,7 +4724,7 @@ void drawSaberGlow() {
 }
 
 void drawWeapon(const Game &g) {
-    if (g.scoped) {
+    if (g.scoped && Weapons[g.weapon].scope) {
         return;
     }
     const Basis b = gunBasis(g);
@@ -6400,9 +6406,9 @@ void drawInventory(const Game &g) {
 }
 
 // Scoped view: black outside a ring, thin black crosshair inside.
-void drawScope(int cx, int cy) {
+void drawScope(int cx, int cy, float radiusScale) {
     const Vector2 c{static_cast<float>(cx), static_cast<float>(cy)};
-    const float r = static_cast<float>(GetScreenHeight()) * 0.42f;
+    const float r = static_cast<float>(GetScreenHeight()) * radiusScale;
     const float outer = std::hypot(static_cast<float>(GetScreenWidth()), static_cast<float>(GetScreenHeight())) * 0.5f;
     DrawRing(c, r, outer, 0.0f, 360.0f, 128, BLACK);
     DrawRing(c, r - 2.0f, r, 0.0f, 360.0f, 128, BLACK);
@@ -6410,6 +6416,19 @@ void drawScope(int cx, int cy) {
     DrawLineEx(Vector2{c.x + 6.0f, c.y}, Vector2{c.x + r, c.y}, 2.0f, BLACK);
     DrawLineEx(Vector2{c.x, c.y - r}, Vector2{c.x, c.y - 6.0f}, 2.0f, BLACK);
     DrawLineEx(Vector2{c.x, c.y + 6.0f}, Vector2{c.x, c.y + r}, 2.0f, BLACK);
+}
+
+// Iron sights: one front post at the centre, two rear posts flanking it below.
+void drawIronSights(int cx, int cy) {
+    constexpr float PostW = 8.0f;
+    const Rectangle front{static_cast<float>(cx) - PostW / 2.0f, static_cast<float>(cy) - 16.0f, PostW, 16.0f};
+    DrawRectangleRec(front, BLACK);
+    DrawRectangleLinesEx(front, 1.0f, Fade(WHITE, 0.6f));
+    for (int side = -1; side <= 1; side += 2) {
+        const Rectangle rear{static_cast<float>(cx + side * 44) - PostW / 2.0f, static_cast<float>(cy) + 14.0f, PostW, 46.0f};
+        DrawRectangleRec(rear, BLACK);
+        DrawRectangleLinesEx(rear, 1.0f, Fade(WHITE, 0.6f));
+    }
 }
 
 // Top-right feed: killer, weapon and icons (headshot, flash, smoke), then victim.
@@ -6511,7 +6530,7 @@ void drawHud(const Game &g, const Playlist &pl) {
                         g.night ? (g.flashlight ? "   Flashlight on (F)" : "   Flashlight off (F)") : ""),
              20, 192, 20, RAYWHITE);
     DrawText(gSettings.teamMode ? "Mode: team (blue allies)" : "Mode: deathmatch", 20, 244, 20, RAYWHITE);
-    DrawText("LMB: shoot/stab   R: reload   1/2/3: weapon   4-7: throwable   MMB: throw   B: buy   RMB: scope   WASD: move   Shift: sprint   Ctrl/C: crouch   Space: jump   G: kick   F5: restart   E: door/chest   ESC: menu",
+    DrawText("LMB: shoot/stab   R: reload   1/2/3: weapon   4-7: throwable   MMB: throw   B: buy   RMB: aim   WASD: move   Shift: sprint   Ctrl/C: crouch   Space: jump   G: kick   F5: restart   E: door/chest   ESC: menu",
              20, GetScreenHeight() - 30, 18, RAYWHITE);
     DrawText("Left/Right: track   Up/Down: volume   M: mute", 20, GetScreenHeight() - 52, 18, RAYWHITE);
     drawMusicInfo(pl);
@@ -6544,8 +6563,10 @@ void drawHud(const Game &g, const Playlist &pl) {
 
     const int cx = GetScreenWidth() / 2;
     const int cy = GetScreenHeight() / 2;
-    if (g.scoped) {
-        drawScope(cx, cy);
+    if (g.scoped && Weapons[g.weapon].scope) {
+        drawScope(cx, cy, 0.42f);
+    } else if (g.scoped) {
+        drawIronSights(cx, cy);
     } else {
         DrawCircleLines(cx, cy, 3.0f, WHITE);
         DrawLine(cx - 10, cy, cx - 4, cy, WHITE);
