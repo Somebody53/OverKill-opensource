@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-inline constexpr const char *GameVersion = "1.1.9.3";
+inline constexpr const char *GameVersion = "1.2";
 
 // One entry from the server's LIST reply.
 struct LobbyInfo {
