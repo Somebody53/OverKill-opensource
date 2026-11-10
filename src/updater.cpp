@@ -333,6 +333,7 @@ bool installUpdate(const std::string &stagingDir, const std::string &installDir)
             << "start \"\" /D \"%INSTALL%\" OverKillOpensource.exe\r\n"
             << "exit /b 0\r\n"
             << ":install\r\n"
+            << "del /F /Q \"%INSTALL%\\OverKillOpensource.exe\" 2>nul\r\n"
             << "copy /Y \"%STAGE%\\windows\\OverKillOpensource.exe\" \"%INSTALL%\\OverKillOpensource.exe\" || exit /b 1\r\n"
             << "if not exist \"%INSTALL%\\mods\" mkdir \"%INSTALL%\\mods\"\r\n"
             << "xcopy /E /I /Y \"%STAGE%\\mods\" \"%INSTALL%\\mods\" || exit /b 1\r\n"
