@@ -90,6 +90,7 @@ struct Door {
     size_t solid;
     bool open = false;
     float angle = 0.0f;
+    bool automatic = false;  // opens by itself when the player or an enemy comes close
 };
 
 struct Level {
@@ -135,5 +136,6 @@ void buildHarbor(Level &L);
 void buildCompound(Level &L);
 void buildArena(Level &L);
 void buildBadlands(Level &L);
+void buildMall(Level &L);
 
 } // namespace world

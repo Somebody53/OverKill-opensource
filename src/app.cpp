@@ -247,6 +247,7 @@ const MapDef Maps[] = {
     {"Compound", "A walled compound with a gated entrance and watchtowers", buildCompound, 1},
     {"Arena", "A ring of walls around an open pit", buildArena, 1},
     {"Badlands", "Eroded ridges and rock fields", buildBadlands, 1},
+    {"Mall", "A shopping mall with automatic shop doors: groceries, clothes, phones, PCs and electronics", buildMall, 1},
 };
 constexpr int MapCount = static_cast<int>(std::size(Maps));
 
@@ -2392,12 +2393,29 @@ bool openNearChest(Game &g) {
 constexpr float DoorReach = 2.2f;
 constexpr float DoorOpenAngle = 95.0f;
 constexpr float DoorSpeed = 150.0f;
+constexpr float AutoDoorReach = 2.6f;
 
-// Index of the nearest door within reach of the player, or -1.
+// True when the player or a living enemy is close enough to keep an automatic door open.
+bool autoDoorTriggered(const Game &g, const Vector3 &c) {
+    if (std::hypot(c.x - g.pos.x, c.z - g.pos.z) < AutoDoorReach) {
+        return true;
+    }
+    for (const Enemy &e : g.enemies) {
+        if (e.hp > 0 && std::hypot(c.x - e.pos.x, c.z - e.pos.z) < AutoDoorReach) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Index of the nearest manual door within reach of the player, or -1.
 int nearDoor(const Game &g) {
     int best = -1;
     float bestD = DoorReach;
     for (size_t i = 0; i < g.level.doors.size(); ++i) {
+        if (g.level.doors[i].automatic) {
+            continue;
+        }
         const Vector3 &c = g.level.doors[i].center;
         const float d = std::hypot(c.x - g.pos.x, c.z - g.pos.z);
         if (d < bestD) {
@@ -2414,6 +2432,11 @@ void updateDoors(Game &g, float dt) {
         const int i = nearDoor(g);
         if (i >= 0) {
             g.level.doors[i].open = !g.level.doors[i].open;
+        }
+    }
+    for (Door &d : g.level.doors) {
+        if (d.automatic) {
+            d.open = autoDoorTriggered(g, d.center);
         }
     }
     const Box gone{Vector3{0.0f, -1000.0f, 0.0f}, Vector3{0.0f, -1000.0f, 0.0f}};

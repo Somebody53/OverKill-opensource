@@ -1198,6 +1198,282 @@ void buildCompound(Level &L) {
     scatterTrees(L, r, 25, t.half - 8.0f);
 }
 
+namespace {
+
+enum class ShopKind { Grocery, Fashion, Electronics, Phones, Computers };
+
+constexpr float MallHalfX = 80.0f;     // outer walls sit at x = +-80
+constexpr float MallHalfZ = 40.0f;     // outer walls sit at z = +-40
+constexpr float MallHall = 6.0f;       // shop fronts face the corridor at z = +-6
+constexpr float MallEntrance = 12.0f;  // half-width of the south entrance and hall
+constexpr float MallWallH = 7.0f;
+constexpr float MallWallT = 0.4f;
+constexpr float HighwayX = 130.0f;
+
+const Color MallWallC{230, 225, 215, 255};
+const Color MallWallA{120, 130, 140, 255};
+const Color MallWood{150, 110, 70, 255};
+const Color MallWoodA{110, 80, 50, 255};
+const Color MallSnacks[] = {Color{230, 60, 40, 255}, Color{250, 190, 30, 255}, Color{60, 140, 220, 255},
+                            Color{90, 170, 60, 255}, Color{240, 120, 30, 255}};
+const Color MallClothes[] = {Color{40, 60, 120, 255},  Color{200, 40, 60, 255},  Color{30, 30, 30, 255},
+                             Color{230, 230, 220, 255}, Color{120, 160, 80, 255}, Color{220, 130, 170, 255}};
+const Color MallPhones[] = {Color{30, 30, 35, 255}, Color{220, 220, 225, 255}, Color{70, 110, 200, 255},
+                            Color{200, 60, 80, 255}};
+const Color MallCars[] = {Color{200, 30, 40, 255}, Color{235, 235, 240, 255}, Color{40, 60, 110, 255},
+                          Color{90, 90, 95, 255}, Color{60, 140, 90, 255}};
+
+// Box centred on (x, z) standing on y.
+void mallBox(Level &L, PropKind kind, float x, float y, float z, float w, float h, float d, Color c, Color a,
+             bool solid) {
+    addBox(L, kind, Vector3{x - w / 2, y, z - d / 2}, Vector3{x + w / 2, y + h, z + d / 2}, c, a, solid);
+}
+
+// One shop between x0 and x1, opening onto the corridor with an automatic door.
+void buildShop(Level &L, Rng &r, float x0, float x1, bool north, ShopKind kind) {
+    const float cx = (x0 + x1) / 2.0f;
+    const float g0 = groundAt(L.terrain, cx, 0.0f);
+    const float zFront = north ? -MallHall : MallHall;
+    const float sgn = north ? 1.0f : -1.0f;  // +1 walks from the back wall towards the corridor
+    const float zIn = north ? -(MallHalfZ - 1.4f) : MallHalfZ - 1.4f;  // row against the back wall
+    auto at = [&](float k) { return zIn + sgn * k; };
+
+    Color sign{};
+    switch (kind) {
+    case ShopKind::Grocery: sign = Color{60, 160, 70, 255}; break;
+    case ShopKind::Fashion: sign = Color{220, 90, 150, 255}; break;
+    case ShopKind::Electronics: sign = Color{40, 110, 210, 255}; break;
+    case ShopKind::Phones: sign = Color{240, 130, 30, 255}; break;
+    case ShopKind::Computers: sign = Color{120, 70, 180, 255}; break;
+    }
+
+    // Front wall with a doorway in the middle, lintel above it.
+    auto seg = [&](float xa, float xb, float y0, float y1) {
+        mallBox(L, PropKind::Wall, (xa + xb) / 2.0f, y0, zFront, xb - xa, y1 - y0, MallWallT, MallWallC, MallWallA, true);
+    };
+    seg(x0, cx - 0.8f, g0, g0 + MallWallH);
+    seg(cx + 0.8f, x1, g0, g0 + MallWallH);
+    seg(cx - 0.8f, cx + 0.8f, g0 + DoorHeight, g0 + MallWallH);
+    const Box shut{Vector3{cx - 0.8f, g0, zFront - DoorThick / 2}, Vector3{cx + 0.8f, g0 + DoorHeight, zFront + DoorThick / 2}};
+    L.solids.push_back(shut);
+    L.doors.push_back(Door{Vector3{cx - 0.8f, g0, zFront}, Vector3{cx, g0, zFront}, shut, L.solids.size() - 1,
+                           false, 0.0f, true});
+    mallBox(L, PropKind::Flat, cx, g0 + 2.7f, zFront + sgn * 0.35f, 3.2f, 0.7f, 0.1f, sign, sign, false);
+    L.bulbs.push_back(Vector3{cx, g0 + MallWallH - 0.6f, at(8.0f)});
+
+    if (kind == ShopKind::Grocery) {
+        // Fridges along the back wall, chip shelves in two aisles.
+        for (int i = 0; i < 4; ++i) {
+            mallBox(L, PropKind::Fridge, cx - 4.5f + 3.0f * i, g0, zIn, 2.2f, 2.0f, 1.0f, Color{235, 240, 245, 255},
+                    i % 2 ? Color{60, 120, 220, 255} : Color{70, 170, 90, 255}, true);
+        }
+        for (float dx : {-3.2f, 3.2f}) {
+            mallBox(L, PropKind::Shelf, cx + dx, g0, at(9.0f), 0.8f, 1.8f, 9.0f, MallWood, MallWoodA, true);
+            for (int k = 0; k < 7; ++k) {
+                const Color c = pick(r, MallSnacks);
+                mallBox(L, PropKind::Pack, cx + dx, g0 + 1.8f, at(5.0f + 1.5f * k), 0.6f, 0.5f, 0.4f, c, c, false);
+            }
+        }
+    } else if (kind == ShopKind::Fashion) {
+        // Clothes folded on shelving units.
+        for (float dx : {-4.5f, 4.5f}) {
+            for (int k = 0; k < 3; ++k) {
+                const float z = at(6.0f + 4.0f * k);
+                mallBox(L, PropKind::Shelf, cx + dx, g0, z, 4.0f, 1.8f, 0.3f, MallWoodA, MallWood, true);
+                for (int j = 0; j < 4; ++j) {
+                    const Color c = pick(r, MallClothes);
+                    mallBox(L, PropKind::Pack, cx + dx - 1.5f + j, g0 + 1.8f, z, 0.7f, 0.3f, 0.5f, c, c, false);
+                }
+            }
+        }
+    } else if (kind == ShopKind::Electronics) {
+        // Wall of TVs, laptop tables.
+        for (float dx : {-4.0f, 0.0f, 4.0f}) {
+            mallBox(L, PropKind::Tv, cx + dx, g0 + 1.2f, zIn, 2.4f, 1.4f, 0.15f, Color{20, 20, 22, 255},
+                    Color{40, 90, 160, 255}, false);
+        }
+        for (float dx : {-4.0f, 4.0f}) {
+            for (float k : {8.0f, 14.0f}) {
+                mallBox(L, PropKind::Table, cx + dx, g0, at(k), 3.0f, 0.9f, 1.2f, MallWood, MallWoodA, true);
+                mallBox(L, PropKind::Pack, cx + dx, g0 + 0.9f, at(k), 0.9f, 0.1f, 0.6f, Color{190, 190, 200, 255},
+                        Color{40, 40, 50, 255}, false);
+            }
+        }
+    } else if (kind == ShopKind::Phones) {
+        // Phone wall and glass-style counters.
+        mallBox(L, PropKind::Shelf, cx, g0, zIn, 10.0f, 2.0f, 0.8f, MallWoodA, MallWood, true);
+        for (int i = 0; i < 6; ++i) {
+            const Color c = pick(r, MallPhones);
+            mallBox(L, PropKind::Pack, cx - 4.0f + 1.6f * i, g0 + 2.0f, zIn, 0.5f, 0.1f, 0.3f, c, c, false);
+        }
+        for (float dx : {-3.0f, 3.0f}) {
+            mallBox(L, PropKind::Table, cx + dx, g0, at(8.0f), 3.0f, 1.0f, 1.0f, Color{200, 210, 220, 255},
+                    Color{120, 130, 140, 255}, true);
+            for (int j = 0; j < 3; ++j) {
+                const Color c = pick(r, MallPhones);
+                mallBox(L, PropKind::Pack, cx + dx - 0.8f + 0.8f * j, g0 + 1.0f, at(8.0f), 0.35f, 0.06f, 0.6f, c, c,
+                        false);
+            }
+        }
+    } else {
+        // Computer desks with monitors and towers.
+        for (float dx : {-3.6f, 3.6f}) {
+            for (float k : {7.0f, 11.0f, 15.0f}) {
+                mallBox(L, PropKind::Table, cx + dx, g0, at(k), 2.4f, 0.9f, 1.0f, MallWood, MallWoodA, true);
+                mallBox(L, PropKind::Tv, cx + dx - 0.3f, g0 + 0.9f, at(k), 1.2f, 0.7f, 0.1f, Color{25, 25, 30, 255},
+                        Color{60, 140, 220, 255}, false);
+                mallBox(L, PropKind::Pack, cx + dx + 0.9f, g0 + 0.9f, at(k), 0.4f, 0.8f, 0.7f, Color{30, 30, 35, 255},
+                        Color{80, 220, 120, 255}, false);
+            }
+        }
+    }
+}
+
+} // namespace
+
+// A large supermarket-style mall with a stepped roof, skylights, a car park and a highway.
+void buildMall(Level &L) {
+    Terrain &t = L.terrain;
+    Rng r{2222u};
+    t.half = RoadSpan + 5.0f;
+    t.amp = 0.0f;
+    t.seed = 83.0f;
+    t.grass = Color{95, 130, 65, 255};
+    t.dirt = Color{110, 100, 85, 255};
+    L.sky = Color{170, 200, 225, 255};
+    L.spawn = Vector3{0.0f, 0.0f, 0.0f};
+
+    const Color asphalt{70, 70, 75, 255};
+    const Color paint{235, 235, 230, 255};
+    const Color roofC{150, 155, 162, 255};
+    const Color roofA{95, 100, 108, 255};
+    const Color glass{120, 170, 210, 255};
+
+    addPlot(L, 0.0f, 0.0f, 2.0f * MallHalfX, 2.0f * MallHalfZ, 2.0f, Color{225, 220, 205, 255});
+    addPlot(L, 0.0f, 70.0f, 2.0f * MallHalfX, 60.0f, 2.0f, asphalt);  // car park
+    addPlot(L, HighwayX, 0.0f, 24.0f, 2.0f * RoadSpan, 0.5f, asphalt);
+
+    auto wall = [&](float x0, float x1, float z0, float z1) {
+        addBox(L, PropKind::Wall, Vector3{x0, 0.0f, z0}, Vector3{x1, MallWallH, z1}, MallWallC, MallWallA, true);
+    };
+    wall(-MallHalfX, MallHalfX, -MallHalfZ, -MallHalfZ + 0.4f);            // north
+    wall(-MallHalfX, -MallEntrance, MallHalfZ - 0.4f, MallHalfZ);          // south, with the entrance gap
+    wall(MallEntrance, MallHalfX, MallHalfZ - 0.4f, MallHalfZ);
+    wall(-MallHalfX, -MallHalfX + 0.4f, -MallHalfZ, MallHalfZ);            // west
+    wall(MallHalfX - 0.4f, MallHalfX, -MallHalfZ, MallHalfZ);              // east
+
+    // Dividers between the shop units.
+    for (float x : {-64.0f, -48.0f, -32.0f, -16.0f, 0.0f, 16.0f, 32.0f, 48.0f, 64.0f}) {
+        wall(x - 0.2f, x + 0.2f, -MallHalfZ, -MallHall);
+    }
+    for (float x : {-63.0f, -46.0f, -29.0f, -MallEntrance, MallEntrance, 29.0f, 46.0f, 63.0f}) {
+        wall(x - 0.2f, x + 0.2f, MallHall, MallHalfZ);
+    }
+
+    // North row: ten shops facing the corridor.
+    const ShopKind north[] = {ShopKind::Grocery,  ShopKind::Fashion,   ShopKind::Electronics, ShopKind::Phones,
+                              ShopKind::Computers, ShopKind::Grocery, ShopKind::Fashion,     ShopKind::Electronics,
+                              ShopKind::Phones,   ShopKind::Computers};
+    for (int i = 0; i < 10; ++i) {
+        buildShop(L, r, -MallHalfX + 16.0f * i, -MallHalfX + 16.0f * (i + 1), true, north[i]);
+    }
+
+    // South row: eight shops either side of the entrance hall.
+    const float sb[] = {-MallHalfX, -63.0f, -46.0f, -29.0f, -MallEntrance, MallEntrance, 29.0f, 46.0f, 63.0f, MallHalfX};
+    const ShopKind south[] = {ShopKind::Fashion,  ShopKind::Grocery,   ShopKind::Phones,      ShopKind::Computers,
+                              ShopKind::Electronics, ShopKind::Fashion, ShopKind::Grocery, ShopKind::Electronics};
+    for (int i = 0; i < 4; ++i) {
+        buildShop(L, r, sb[i], sb[i + 1], false, south[i]);
+        buildShop(L, r, sb[i + 5], sb[i + 6], false, south[i + 4]);
+    }
+
+    // Corridor furniture and lights.
+    for (float x : {-40.0f, 40.0f}) {
+        for (float z : {-2.4f, 2.4f}) {
+            addProp(L, PropKind::Plant, x, z, 0.8f, 1.5f, 0.8f, Color{150, 90, 60, 255}, Color{40, 120, 50, 255}, false);
+        }
+    }
+    for (float x : {-20.0f, 20.0f}) {
+        for (float z : {-2.4f, 2.4f}) {
+            addProp(L, PropKind::Couch, x, z, 2.2f, 0.9f, 0.8f, Color{70, 90, 130, 255}, Color{100, 120, 160, 255}, true);
+        }
+    }
+    for (float x : {-70.0f, -50.0f, -30.0f, -10.0f, 10.0f, 30.0f, 50.0f, 70.0f}) {
+        L.bulbs.push_back(Vector3{x, MallWallH - 0.6f, 0.0f});
+    }
+
+    // Entrance hall: information desk, seating, plants and a sign.
+    addProp(L, PropKind::Table, 0.0f, 14.0f, 2.0f, 1.0f, 1.0f, MallWood, MallWoodA, true);
+    addProp(L, PropKind::Couch, -4.0f, 19.0f, 2.2f, 0.9f, 0.8f, Color{70, 90, 130, 255}, Color{100, 120, 160, 255}, true);
+    addProp(L, PropKind::Couch, 4.0f, 19.0f, 2.2f, 0.9f, 0.8f, Color{70, 90, 130, 255}, Color{100, 120, 160, 255}, true);
+    addProp(L, PropKind::Plant, -6.0f, 8.0f, 0.8f, 1.5f, 0.8f, Color{150, 90, 60, 255}, Color{40, 120, 50, 255}, false);
+    addProp(L, PropKind::Plant, 6.0f, 8.0f, 0.8f, 1.5f, 0.8f, Color{150, 90, 60, 255}, Color{40, 120, 50, 255}, false);
+    L.bulbs.push_back(Vector3{0.0f, MallWallH - 0.6f, 14.0f});
+    mallBox(L, PropKind::Flat, 0.0f, 3.8f, 23.4f, 10.0f, 0.8f, 0.1f, Color{200, 30, 40, 255}, Color{200, 30, 40, 255},
+            false);
+
+    // Entrance canopy with two pillars.
+    addBox(L, PropKind::Wall, Vector3{-16.0f, 4.8f, 40.0f}, Vector3{16.0f, 5.3f, 48.0f}, roofC, roofA, false);
+    for (float x : {-15.0f, 15.0f}) {
+        addBox(L, PropKind::Wall, Vector3{x - 0.3f, 0.0f, 46.5f}, Vector3{x + 0.3f, 4.8f, 47.1f}, MallWallC, MallWallA,
+               true);
+    }
+
+    // Stepped roof: eaves, a raised atrium and a higher skylight tier.
+    addBox(L, PropKind::Wall, Vector3{-MallHalfX - 1.0f, MallWallH, -MallHalfZ - 1.0f},
+           Vector3{MallHalfX + 1.0f, MallWallH + 0.6f, MallHalfZ + 1.0f}, roofC, roofA, false);
+    addBox(L, PropKind::Wall, Vector3{-44.0f, MallWallH + 0.6f, -18.0f}, Vector3{44.0f, 10.0f, 18.0f}, roofC, roofA,
+           false);
+    addBox(L, PropKind::Wall, Vector3{-22.0f, 10.0f, -9.0f}, Vector3{22.0f, 12.5f, 9.0f}, roofC, roofA, false);
+    auto glassSlab = [&](float x0, float x1, float z0, float z1, float y) {
+        addBox(L, PropKind::Window, Vector3{x0, y, z0}, Vector3{x1, y + 0.12f, z1}, glass, glass, false);
+    };
+    glassSlab(-44.0f, -22.0f, -18.0f, 18.0f, 10.0f);
+    glassSlab(22.0f, 44.0f, -18.0f, 18.0f, 10.0f);
+    glassSlab(-22.0f, 22.0f, -18.0f, -9.0f, 10.0f);
+    glassSlab(-22.0f, 22.0f, 9.0f, 18.0f, 10.0f);
+    glassSlab(-22.0f, 22.0f, -9.0f, 9.0f, 12.5f);
+
+    // Car park: stall lines and parked cars.
+    for (float x = -78.0f; x <= 78.0f; x += 6.0f) {
+        addBox(L, PropKind::Flat, Vector3{x - 0.1f, 0.02f, 44.0f}, Vector3{x + 0.1f, 0.05f, 96.0f}, paint, paint, false);
+    }
+    for (float x = -75.0f; x <= 75.0f; x += 6.0f) {
+        if (r.next() < 0.3f) {
+            continue;
+        }
+        L.cars.push_back(Car{56.0f, x, 1.0f, 0.0f, false, false, pick(r, MallCars)});
+        L.cars.push_back(Car{84.0f, x, -1.0f, 0.0f, false, false, pick(r, MallCars)});
+    }
+
+    // Highway: four lanes with a dashed centre line and moving traffic.
+    for (float z = -RoadSpan; z < RoadSpan; z += 12.0f) {
+        addBox(L, PropKind::Flat, Vector3{HighwayX - 0.12f, 0.02f, z}, Vector3{HighwayX + 0.12f, 0.05f, z + 6.0f}, paint,
+               paint, false);
+    }
+    for (float lane : {121.0f, 127.0f, 133.0f, 139.0f}) {
+        const float dir = lane < HighwayX ? 1.0f : -1.0f;
+        for (int n = 0; n < 6; ++n) {
+            L.cars.push_back(Car{r.range(-RoadSpan, RoadSpan), lane, dir, r.range(10.0f, 16.0f), false, false,
+                                 pick(r, MallCars)});
+        }
+    }
+    for (float z = -RoadSpan + 10.0f; z < RoadSpan; z += 30.0f) {
+        placeLamp(L, HighwayX - 13.0f, z);
+        placeLamp(L, HighwayX + 13.0f, z);
+    }
+
+    // Trees around the site.
+    for (float z : {-120.0f, -60.0f, 0.0f, 60.0f, 120.0f}) {
+        addTree(L, -96.0f, z, 7.0f);
+    }
+    for (float x : {-60.0f, -20.0f, 20.0f, 60.0f}) {
+        addTree(L, x, -70.0f, 7.0f);
+    }
+
+    addBoundary(L, Color{110, 110, 115, 255});
+}
+
 void buildArena(Level &L) {
     Terrain &t = L.terrain;
     Rng r{2020u};
