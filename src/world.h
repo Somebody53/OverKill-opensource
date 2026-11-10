@@ -45,7 +45,8 @@ struct Terrain {
 
 enum class PropKind {
     Crate, Wall, Net, Flat, House, Barn, Silo, Tree,
-    Couch, Tv, Table, Pack, Shelf, Bed, Fridge, Plant, Window, Person
+    Couch, Tv, Table, Pack, Shelf, Bed, Fridge, Plant, Window, Person,
+    Pumpkin, Egg, Bunny, Heart, Sprinkler, Gift
 };
 
 struct Prop {
@@ -76,6 +77,7 @@ struct Car {
     bool alongX;
     bool police;
     Color color;
+    float wheelSpin = 0.0f;  // radians rolled by the wheels
 };
 
 constexpr float DoorWidth = 1.6f;

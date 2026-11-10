@@ -7,6 +7,7 @@
 #include "world.h"
 #include "mods.h"
 #include "skins.h"
+#include "events.h"
 #include "lobby_net.h"
 #include "server_lookup.h"
 #include "updater.h"
@@ -115,6 +116,7 @@ constexpr float FlashRange = 30.0f;
 constexpr int ChirpCount = 3;
 constexpr float CarLength = 4.6f;
 constexpr float CarWidth = 2.2f;
+constexpr float CarWheelRadius = 0.4f;
 constexpr float CarHeight = 1.6f;
 constexpr float SignalCycle = 16.0f;
 constexpr int StartReserve = 48;
@@ -432,6 +434,9 @@ struct Enemy {
     int gunSkin = -1;           // online: remote player's gun skin for the weapon in hand
     int knifeSkin = -1;         // online: remote player's knife skin
     Vector3 netPos{};           // online: last position reported by the remote player
+    Vector3 lastPos{};          // position last frame, used for the walk animation
+    float walkPhase = 0.0f;     // leg swing phase
+    float walkAmount = 0.0f;    // 0 standing still, 1 full stride
 };
 
 struct Target {
@@ -478,6 +483,22 @@ struct Bird {
 Vector3 enemyPoint(const Enemy &e, float sideOffset, float y) {
     const Vector3 side{-e.dir.z, 0.0f, e.dir.x};
     return {e.pos.x + side.x * sideOffset, e.pos.y + y, e.pos.z + side.z * sideOffset};
+}
+
+// Derives each fighter's walk cycle from its horizontal speed; large jumps (respawns) are ignored.
+void animateWalk(std::vector<Enemy> &enemies, float dt) {
+    if (dt <= 0.0f) {
+        return;
+    }
+    for (Enemy &e : enemies) {
+        const Vector3 moved = Vector3Subtract(e.pos, e.lastPos);
+        e.lastPos = e.pos;
+        const float raw = Vector3Length(Vector3{moved.x, 0.0f, moved.z}) / dt;
+        const float speed = raw > 12.0f ? 0.0f : raw;
+        const float target = std::min(1.0f, speed / 2.0f);
+        e.walkAmount += (target - e.walkAmount) * std::min(1.0f, dt * 10.0f);
+        e.walkPhase = std::fmod(e.walkPhase + speed * dt * 2.6f, 2.0f * Pi);
+    }
 }
 
 std::vector<Target> targetsOf(const Enemy &e) {
@@ -1343,6 +1364,7 @@ void updateCars(Game &g, float dt) {
             }
         }
         c.pos += c.dir * speed * dt;
+        c.wheelSpin = std::fmod(c.wheelSpin + c.dir * speed * dt / CarWheelRadius, 2.0f * Pi);
         if (c.pos > RoadSpan) {
             c.pos -= 2.0f * RoadSpan;
         } else if (c.pos < -RoadSpan) {
@@ -4122,6 +4144,7 @@ void update(Game &g, Audio &a, float dt) {
         updateEnemies(g, a, dt);
     }
     reapEnemies(g);
+    animateWalk(g.enemies, dt);
     if (g.freshKill) {
         g.freshKill = false;
         onKill(g, a);
@@ -4861,6 +4884,99 @@ void drawBox(Vector3 c, Vector3 s, Color col, Color wire) {
     DrawCubeWiresV(c, s, wire);
 }
 
+struct GameModels {
+    Model tree{};
+    Model pumpkin{};
+    Model sedan{};
+    Model suv{};
+};
+
+// Kenney GLB models from assets/models, loaded on first use; a missing file draws nothing.
+const GameModels &gameModels() {
+    static GameModels m;
+    static bool loaded = false;
+    if (!loaded) {
+        const std::string dir = std::string(GetApplicationDirectory()) + "assets/models/";
+        m.tree = LoadModel((dir + "xmas_tree.glb").c_str());
+        m.pumpkin = LoadModel((dir + "pumpkin.glb").c_str());
+        m.sedan = LoadModel((dir + "car_sedan.glb").c_str());
+        m.suv = LoadModel((dir + "car_suv.glb").c_str());
+        loaded = true;
+    }
+    return m;
+}
+
+// Draws a model standing on base, scaled so its largest extent is size, turned yawDeg around Y.
+void drawModelOn(const Model &m, Vector3 base, float size, float yawDeg, Color tint) {
+    const BoundingBox b = GetModelBoundingBox(m);
+    const float ex = b.max.x - b.min.x, ey = b.max.y - b.min.y, ez = b.max.z - b.min.z;
+    const float largest = std::max(ex, std::max(ey, ez));
+    if (largest <= 0.0f) {
+        return;
+    }
+    const float s = size / largest;
+    const float a = yawDeg * DEG2RAD;
+    const float cx = (b.min.x + b.max.x) / 2 * s, cz = (b.min.z + b.max.z) / 2 * s;
+    // Rotated model centre, so the footprint centre lands on base.
+    const float rx = cx * cosf(a) + cz * sinf(a);
+    const float rz = -cx * sinf(a) + cz * cosf(a);
+    DrawModelEx(m, Vector3{base.x - rx, base.y - b.min.y * s, base.z - rz}, Vector3{0, 1, 0}, yawDeg,
+                Vector3{s, s, s}, tint);
+}
+
+// Draws a car model like drawModelOn, but each wheel mesh turns about its own axle by spin radians.
+void drawCarModel(const Model &m, Vector3 base, float yawDeg, float spin, Color tint) {
+    const BoundingBox b = GetModelBoundingBox(m);
+    const float ex = b.max.x - b.min.x, ey = b.max.y - b.min.y, ez = b.max.z - b.min.z;
+    const float largest = std::max(ex, std::max(ey, ez));
+    if (largest <= 0.0f) {
+        return;
+    }
+    const float s = CarLength / largest;
+    const float a = yawDeg * DEG2RAD;
+    const float cx = (b.min.x + b.max.x) / 2 * s, cz = (b.min.z + b.max.z) / 2 * s;
+    const float rx = cx * cosf(a) + cz * sinf(a);
+    const float rz = -cx * sinf(a) + cz * cosf(a);
+    const Matrix overall = MatrixMultiply(
+        MatrixMultiply(MatrixScale(s, s, s), MatrixRotateY(a)),
+        MatrixTranslate(base.x - rx, base.y - b.min.y * s, base.z - rz));
+
+    // The body is the mesh with the largest volume; every other mesh is a wheel.
+    int body = 0;
+    float bestVolume = -1.0f;
+    for (int i = 0; i < m.meshCount; ++i) {
+        const BoundingBox mb = GetMeshBoundingBox(m.meshes[i]);
+        const Vector3 d = Vector3Subtract(mb.max, mb.min);
+        const float volume = d.x * d.y * d.z;
+        if (volume > bestVolume) {
+            bestVolume = volume;
+            body = i;
+        }
+    }
+    for (int i = 0; i < m.meshCount; ++i) {
+        Material mat = m.materials[m.meshMaterial[i]];
+        mat.maps[MATERIAL_MAP_DIFFUSE].color = tint;
+        Matrix transform = overall;
+        if (i != body) {
+            const BoundingBox wb = GetMeshBoundingBox(m.meshes[i]);
+            const Vector3 center = Vector3Scale(Vector3Add(wb.min, wb.max), 0.5f);
+            const Vector3 d = Vector3Subtract(wb.max, wb.min);
+            // The axle runs along the thinnest extent of the wheel.
+            Vector3 axle{1.0f, 0.0f, 0.0f};
+            if (d.y <= d.x && d.y <= d.z) {
+                axle = Vector3{0.0f, 1.0f, 0.0f};
+            } else if (d.z <= d.x && d.z <= d.y) {
+                axle = Vector3{0.0f, 0.0f, 1.0f};
+            }
+            const Matrix spinM = MatrixMultiply(
+                MatrixMultiply(MatrixTranslate(-center.x, -center.y, -center.z), MatrixRotate(axle, spin)),
+                MatrixTranslate(center.x, center.y, center.z));
+            transform = MatrixMultiply(spinM, overall);
+        }
+        DrawMesh(m.meshes[i], mat, transform);
+    }
+}
+
 void drawProp(const Prop &p) {
     const Vector3 o = p.base;
     const Vector3 c{o.x, o.y + p.h / 2, o.z};
@@ -4907,6 +5023,10 @@ void drawProp(const Prop &p) {
         break;
     }
     case PropKind::Tree: {
+        if (gSeason == SeasonEvent::Christmas && gameModels().tree.meshCount > 0) {
+            drawModelOn(gameModels().tree, o, p.h, 0.0f, WHITE);
+            break;
+        }
         DrawCylinderEx(o, Vector3{o.x, o.y + p.h * 0.4f, o.z}, 0.25f, 0.2f, 8, p.accent);
         DrawSphere(Vector3{o.x, o.y + p.h * 0.65f, o.z}, p.w, p.color);
         break;
@@ -4946,6 +5066,45 @@ void drawProp(const Prop &p) {
     case PropKind::Person:
         DrawCylinderEx(o, Vector3{o.x, o.y + 1.2f, o.z}, 0.22f, 0.2f, 8, p.color);
         DrawSphere(Vector3{o.x, o.y + 1.5f, o.z}, 0.2f, p.accent);
+        break;
+    case PropKind::Pumpkin:
+        if (gameModels().pumpkin.meshCount > 0) {
+            drawModelOn(gameModels().pumpkin, o, p.w, 0.0f, WHITE);
+            break;
+        }
+        DrawSphere(Vector3{o.x, o.y + p.h * 0.5f, o.z}, p.w / 2, p.color);
+        DrawCylinderEx(Vector3{o.x, o.y + p.h * 0.9f, o.z}, Vector3{o.x, o.y + p.h * 1.1f, o.z}, 0.08f, 0.06f, 6,
+                       p.accent);
+        break;
+    case PropKind::Egg:
+        DrawSphere(Vector3{o.x, o.y + p.h * 0.5f, o.z}, p.w / 2, p.color);
+        DrawSphere(Vector3{o.x, o.y + p.h * 0.75f, o.z}, p.w * 0.2f, p.accent);
+        break;
+    case PropKind::Bunny:
+        DrawSphere(Vector3{o.x, o.y + p.h * 0.35f, o.z}, p.w * 0.5f, p.color);
+        DrawSphere(Vector3{o.x, o.y + p.h * 0.75f, o.z}, p.w * 0.35f, p.color);
+        for (float side : {-1.0f, 1.0f}) {
+            DrawCylinderEx(Vector3{o.x + side * p.w * 0.15f, o.y + p.h * 0.85f, o.z},
+                           Vector3{o.x + side * p.w * 0.15f, o.y + p.h * 1.25f, o.z}, p.w * 0.1f, p.w * 0.1f, 6,
+                           p.accent);
+        }
+        break;
+    case PropKind::Heart: {
+        const float r = p.w * 0.25f;
+        const float y = o.y + p.h * 0.7f;
+        DrawSphere(Vector3{o.x - r, y, o.z}, r, p.color);
+        DrawSphere(Vector3{o.x + r, y, o.z}, r, p.color);
+        DrawCylinderEx(Vector3{o.x, y, o.z}, Vector3{o.x, o.y, o.z}, p.w * 0.4f, 0.02f, 8, p.color);
+        break;
+    }
+    case PropKind::Sprinkler:
+        DrawCylinderEx(o, Vector3{o.x, o.y + p.h * 0.8f, o.z}, p.w * 0.12f, p.w * 0.12f, 6, p.color);
+        DrawSphere(Vector3{o.x, o.y + p.h * 0.85f, o.z}, p.w * 0.35f, p.accent);
+        break;
+    case PropKind::Gift:
+        drawBox(c, s, p.color, wire);
+        DrawCubeV(c, Vector3{p.w * 0.14f, p.h * 1.03f, p.d * 1.03f}, p.accent);
+        DrawCubeV(c, Vector3{p.w * 1.03f, p.h * 1.03f, p.d * 0.14f}, p.accent);
         break;
     }
 }
@@ -5174,13 +5333,20 @@ void drawEnemyBars(const Game &g) {
     }
 }
 
-void drawCar(const Car &c, const Terrain &t, float dim) {
+void drawCar(const Car &c, const Terrain &t, float dim, bool silhouette = false) {
     const Vector3 p = carCenter(c);
     const float y = groundAt(t, p.x, p.z);
     const Vector3 body = c.alongX ? Vector3{CarLength, 0.9f, CarWidth} : Vector3{CarWidth, 0.9f, CarLength};
     const Vector3 cabin = c.alongX ? Vector3{2.4f, 0.7f, CarWidth - 0.3f} : Vector3{CarWidth - 0.3f, 0.7f, 2.4f};
-    DrawCubeV(Vector3{p.x, y + 0.6f, p.z}, body, dimmed(c.color, dim));
-    DrawCubeV(Vector3{p.x, y + 1.25f, p.z}, cabin, dimmed(Color{40, 50, 60, 255}, dim));
+    const Model &cm = c.police ? gameModels().suv : gameModels().sedan;
+    if (cm.meshCount > 0 && !silhouette) {
+        const BoundingBox bb = GetModelBoundingBox(cm);
+        const bool modelLongX = bb.max.x - bb.min.x >= bb.max.z - bb.min.z;
+        drawCarModel(cm, Vector3{p.x, y, p.z}, modelLongX == c.alongX ? 0.0f : 90.0f, c.wheelSpin, dimmed(WHITE, dim));
+    } else {
+        DrawCubeV(Vector3{p.x, y + 0.6f, p.z}, body, dimmed(c.color, dim));
+        DrawCubeV(Vector3{p.x, y + 1.25f, p.z}, cabin, dimmed(Color{40, 50, 60, 255}, dim));
+    }
     if (c.police) {
         const bool red = std::fmod(GetTime(), 0.5) < 0.25;
         DrawCubeV(Vector3{p.x, y + 1.7f, p.z}, Vector3{0.8f, 0.2f, 0.4f},
@@ -5879,7 +6045,7 @@ void drawPlanarShadows(const Game &g, const View &view) {
         }
         rlPushMatrix();
         applyShadowProjection(L, groundAt(g.level.terrain, p.x, p.z));
-        drawCar(c, g.level.terrain, 1.0f);
+        drawCar(c, g.level.terrain, 1.0f, true);
         rlDrawRenderBatchActive();
         rlPopMatrix();
     }
@@ -5916,6 +6082,122 @@ void drawPlanarShadows(const Game &g, const View &view) {
     beginLit();
 }
 
+struct SeasonModels {
+    Model snow{};
+    Model leaf{};
+    Model petal{};
+};
+
+// OBJ meshes from assets/models, loaded on first use; a missing file draws nothing.
+const SeasonModels &seasonModels() {
+    static SeasonModels m;
+    static bool loaded = false;
+    if (!loaded) {
+        const std::string dir = std::string(GetApplicationDirectory()) + "assets/models/";
+        m.snow = LoadModel((dir + "snowflake.obj").c_str());
+        m.leaf = LoadModel((dir + "leaf.obj").c_str());
+        m.petal = LoadModel((dir + "petal.obj").c_str());
+        loaded = true;
+    }
+    return m;
+}
+
+// 3D fireworks bursting around the camera during the New Year event.
+void drawFireworks3D(const Game &g) {
+    if (gSeason != SeasonEvent::NewYear) {
+        return;
+    }
+    constexpr float Period = 2.5f;
+    constexpr float Life = 1.6f;
+    constexpr int Sparks = 28;
+    constexpr float Speed = 9.0f;
+    constexpr float Gravity = 3.0f;
+    const Color Palette[] = {RED, GOLD, SKYBLUE, GREEN, PINK, ORANGE};
+    const auto rnd = [](float x) { return std::fmod(std::fabs(std::sin(x) * 43758.5453f), 1.0f); };
+    const float t = static_cast<float>(GetTime());
+    const int latest = static_cast<int>(t / Period);
+    const Vector3 cam = g.cam.position;
+    setEmissive(true);
+    for (int b = latest - 1; b <= latest; ++b) {
+        const float age = t - static_cast<float>(b) * Period;
+        if (b < 0 || age < 0.0f || age > Life) {
+            continue;
+        }
+        const float fb = static_cast<float>(b);
+        const float cx = cam.x + (rnd(fb * 12.9898f) - 0.5f) * 60.0f;
+        const float cz = cam.z + (rnd(fb * 78.233f) - 0.5f) * 60.0f;
+        const float cy = cam.y + 8.0f + rnd(fb * 39.346f) * 8.0f;
+        const Color base = Palette[static_cast<int>(rnd(fb * 4.1f) * 6.0f) % 6];
+        const Color c = Fade(base, 1.0f - age / Life);
+        for (int k = 0; k < Sparks; ++k) {
+            const float fk = static_cast<float>(k);
+            const float yy = 1.0f - 2.0f * (fk + 0.5f) / static_cast<float>(Sparks);
+            const float r = std::sqrt(1.0f - yy * yy);
+            const float phi = fk * 2.39996f;
+            const Vector3 p{cx + std::cos(phi) * r * Speed * age,
+                            cy + yy * Speed * age - 0.5f * Gravity * age * age,
+                            cz + std::sin(phi) * r * Speed * age};
+            DrawModel(seasonModels().snow, p, 0.25f, c);
+        }
+    }
+    setEmissive(false);
+}
+
+// Falling snow, leaves, petals, embers or sparkles around the camera, drawn in the world pass.
+void drawSeasonParticles3D(const Game &g) {
+    const SeasonInfo &s = seasonInfo();
+    if (s.weather == Weather::None) {
+        return;
+    }
+    const SeasonModels &m = seasonModels();
+    setEmissive(true);
+    constexpr int Count = 90;
+    constexpr float Span = 50.0f;
+    constexpr float Height = 22.0f;
+    const float t = static_cast<float>(GetTime());
+    const Vector3 cam = g.cam.position;
+    const Color c = Fade(s.weatherColor, 0.85f);
+    for (int i = 0; i < Count; ++i) {
+        const float fi = static_cast<float>(i);
+        const float speed = 2.5f + static_cast<float>(i % 5) * 0.6f;
+        const float ox = std::fmod(fi * 37.0f, Span) - Span * 0.5f + std::sin(t * 0.9f + fi) * 0.8f;
+        const float oz = std::fmod(fi * 71.0f, Span) - Span * 0.5f + std::cos(t * 0.7f + fi) * 0.8f;
+        const float fall = std::fmod(fi * 13.0f + t * speed, Height);
+        const bool rising = s.weather == Weather::Embers;
+        const float y = rising ? cam.y - Height * 0.5f + fall : cam.y + Height * 0.5f - fall;
+        const Vector3 p{cam.x + ox, y, cam.z + oz};
+        switch (s.weather) {
+        case Weather::Snow:
+            DrawModel(m.snow, p, 0.12f + static_cast<float>(i % 3) * 0.04f, c);
+            break;
+        case Weather::Leaves:
+            rlPushMatrix();
+            rlTranslatef(p.x, p.y, p.z);
+            rlRotatef(t * 90.0f + fi * 30.0f, 0.0f, 1.0f, 0.0f);
+            rlRotatef(t * 60.0f + fi * 20.0f, 1.0f, 0.0f, 0.0f);
+            DrawModel(m.leaf, Vector3{0.0f, 0.0f, 0.0f}, 0.9f, c);
+            rlPopMatrix();
+            break;
+        case Weather::Petals:
+            rlPushMatrix();
+            rlTranslatef(p.x, p.y, p.z);
+            rlRotatef(t * 45.0f + fi * 25.0f, 0.0f, 0.0f, 1.0f);
+            DrawModel(m.petal, Vector3{0.0f, 0.0f, 0.0f}, 0.9f, c);
+            rlPopMatrix();
+            break;
+        case Weather::Embers:
+            DrawModel(m.snow, p, 0.1f + static_cast<float>(i % 2) * 0.04f, c);
+            break;
+        case Weather::Sparkles:
+            DrawModel(m.snow, p, 0.08f + std::fabs(std::sin(t * 4.0f + fi)) * 0.1f, c);
+            break;
+        default:
+            break;
+        }
+    }
+    setEmissive(false);
+}
+
 void drawWorld(const Game &g) {
     // Potato mode has no lit shader, so night dimming is applied on the CPU instead.
     const float dim = (g.night && gSettings.potato) ? nightDim() : 1.0f;
@@ -5923,6 +6205,8 @@ void drawWorld(const Game &g) {
     updateStatic();
     drawSkyBody(g);
     drawLevel(g.level, dim, &view);
+    drawSeasonParticles3D(g);
+    drawFireworks3D(g);
     if (gSettings.shadows) {
         drawPlanarShadows(g, view);
     }
@@ -5964,8 +6248,12 @@ void drawWorld(const Game &g) {
         DrawCapsule(enemyPoint(e, 0.0f, 0.45f), enemyPoint(e, 0.0f, 1.3f), 0.35f, 8, 8, body);
         DrawCapsuleWires(enemyPoint(e, 0.0f, 0.45f), enemyPoint(e, 0.0f, 1.3f), 0.35f, 8, 8, blue ? DARKBLUE : MAROON);
         DrawSphere(enemyPoint(e, 0.0f, HeadY), HeadRadius, Color{235, 200, 170, 255});
-        DrawCapsule(enemyPoint(e, 0.3f, 1.25f), enemyPoint(e, 0.6f, 0.6f), 0.12f, 6, 6, body);
-        DrawCapsule(enemyPoint(e, -0.3f, 1.25f), enemyPoint(e, -0.6f, 0.6f), 0.12f, 6, 6, body);
+        const float swing = std::sin(e.walkPhase) * e.walkAmount;
+        const Color limbCol = Color{40, 40, 50, 255};
+        DrawCapsule(enemyPoint(e, 0.15f, 0.5f), Vector3Add(enemyPoint(e, 0.15f, 0.1f), Vector3Scale(e.dir, 0.25f * swing)), 0.1f, 6, 6, limbCol);
+        DrawCapsule(enemyPoint(e, -0.15f, 0.5f), Vector3Add(enemyPoint(e, -0.15f, 0.1f), Vector3Scale(e.dir, -0.25f * swing)), 0.1f, 6, 6, limbCol);
+        DrawCapsule(enemyPoint(e, 0.3f, 1.25f), Vector3Add(enemyPoint(e, 0.6f, 0.6f), Vector3Scale(e.dir, -0.2f * swing)), 0.12f, 6, 6, body);
+        DrawCapsule(enemyPoint(e, -0.3f, 1.25f), Vector3Add(enemyPoint(e, -0.6f, 0.6f), Vector3Scale(e.dir, 0.2f * swing)), 0.12f, 6, 6, body);
         // The enemy's gun sits in its right hand, barrel along the facing direction.
         const Vector3 hand{e.pos.x + e.dir.x * 0.35f, e.pos.y + 1.05f, e.pos.z + e.dir.z * 0.35f};
         rlPushMatrix();
@@ -7613,6 +7901,10 @@ void handleInvLine(CasesMenu &cm, const std::string &line) {
         int idx = -1;
         ss >> kind >> idx;
         startDropReel(cm, kind == "knife", idx);
+    } else if (cmd == "EVENT") {
+        std::string id;
+        ss >> id;
+        gSeason = seasonFromId(id);
     } else if (cmd == "ERR") {
         std::string code;
         ss >> code;
@@ -8202,6 +8494,9 @@ void drawUpdateScreen(const UpdateScreen &up) {
 }
 
 void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Playlist &pl) {
+    if (gSeason != SeasonEvent::Default) {
+        ClearBackground(seasonInfo().menuBg);
+    }
     drawLogo();
     drawAvatarTile();
     drawMapCards(menu, previews);
@@ -8220,6 +8515,10 @@ void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Play
     if (!gLatestVersion.empty() && gLatestVersion != GameVersion) {
         const char *notice = TextFormat("Update available: v%s", gLatestVersion.c_str());
         DrawText(notice, GetScreenWidth() - MeasureText(notice, 18) - 12, H - 52, 18, GOLD);
+    }
+    if (gSeason != SeasonEvent::Default) {
+        const char *banner = TextFormat("Event: %s", seasonInfo().label);
+        DrawText(banner, GetScreenWidth() - MeasureText(banner, 20) - 12, H - 74, 20, seasonInfo().tint);
     }
     drawMusicInfo(pl);
     drawSettingsButton();

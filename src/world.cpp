@@ -1,5 +1,6 @@
 #include "world.h"
 
+#include "events.h"
 #include "raymath.h"
 
 #include <algorithm>
@@ -13,7 +14,7 @@ namespace {
 
 constexpr float Pi = 3.14159265f;
 constexpr float CellSize = 2.0f;
-constexpr int TerrainCells = 160;
+constexpr int TerrainCells = 250;
 
 // '#' wall, '.' floor, 'S' player spawn
 const char *ClassicRows[] = {
@@ -100,6 +101,78 @@ float rawHeight(const Terrain &t, float x, float z) {
     return h;
 }
 
+// Blocky ground colours for seasonal events; returns false when the event keeps the map ground.
+static bool seasonGround(float x, float z, Color &out) {
+    float block = 0.0f;
+    float speckAt = 2.0f;
+    Color a{}, b{}, c{}, speck{};
+    switch (gSeason) {
+    case SeasonEvent::NewYear:
+        block = 1.0f;
+        a = Color{30, 30, 60, 255};
+        b = Color{40, 40, 75, 255};
+        c = Color{55, 50, 90, 255};
+        speck = Color{255, 215, 90, 255};
+        speckAt = 0.93f;
+        break;
+    case SeasonEvent::Spring:
+        block = 1.0f;
+        a = Color{245, 185, 215, 255};
+        b = Color{235, 160, 200, 255};
+        c = Color{250, 205, 225, 255};
+        speck = Color{220, 130, 175, 255};
+        speckAt = 0.9f;
+        break;
+    case SeasonEvent::Easter:
+        block = 1.0f;
+        a = Color{250, 200, 235, 255};
+        b = Color{240, 180, 225, 255};
+        c = Color{255, 220, 240, 255};
+        speck = Color{200, 240, 190, 255};
+        speckAt = 0.95f;
+        break;
+    case SeasonEvent::Summer:
+        block = 1.5f;
+        a = Color{70, 150, 55, 255};
+        b = Color{95, 180, 75, 255};
+        c = Color{120, 190, 85, 255};
+        break;
+    case SeasonEvent::Fall:
+        block = 1.0f;
+        a = Color{140, 85, 40, 255};
+        b = Color{160, 100, 45, 255};
+        c = Color{110, 65, 30, 255};
+        speck = Color{210, 110, 40, 255};
+        speckAt = 0.9f;
+        break;
+    case SeasonEvent::Halloween:
+        block = 1.0f;
+        a = Color{45, 25, 15, 255};
+        b = Color{60, 30, 12, 255};
+        c = Color{30, 20, 20, 255};
+        speck = Color{230, 110, 30, 255};
+        speckAt = 0.93f;
+        break;
+    case SeasonEvent::Valentine:
+    case SeasonEvent::Christmas:
+        block = 1.5f;
+        a = Color{235, 240, 250, 255};
+        b = Color{250, 252, 255, 255};
+        c = Color{225, 232, 242, 255};
+        break;
+    default:
+        return false;
+    }
+    const float ix = std::floor(x / block);
+    const float iz = std::floor(z / block);
+    const float h = std::fmod(std::fabs(std::sin(ix * 127.1f + iz * 311.7f) * 43758.5453f), 1.0f);
+    out = h < 0.33f ? a : (h < 0.66f ? b : c);
+    if (h > speckAt) {
+        out = speck;
+    }
+    return true;
+}
+
 Color surfaceColor(const Terrain &t, float x, float z, float upY) {
     Color base = t.grass;
     bool special = false;
@@ -116,8 +189,13 @@ Color surfaceColor(const Terrain &t, float x, float z, float upY) {
             special = true;
         }
     }
-    if (!special && upY < 0.7f) {
-        base = t.dirt;
+    if (!special) {
+        Color patterned{};
+        if (seasonGround(x, z, patterned)) {
+            base = patterned;
+        } else if (upY < 0.7f) {
+            base = t.dirt;
+        }
     }
     const float shade = 0.55f + 0.45f * upY;
     return Color{static_cast<unsigned char>(base.r * shade), static_cast<unsigned char>(base.g * shade),
@@ -507,7 +585,146 @@ Vector3 sunDirection() {
     return Vector3Normalize(Vector3{0.6f, 0.5f, 0.4f});
 }
 
+const Color GiftColors[] = {Color{200, 40, 40, 255}, Color{40, 110, 200, 255}, Color{60, 170, 90, 255}};
+const Color EggColors[] = {Color{255, 200, 220, 255}, Color{190, 230, 255, 255}, Color{220, 255, 190, 255},
+                           Color{255, 240, 160, 255}, Color{220, 200, 255, 255}};
+const Color LeafColors[] = {Color{170, 80, 25, 255}, Color{205, 130, 40, 255}, Color{120, 60, 20, 255}};
+
+// Decorations never block movement; they stay off walls, plots, fields and the spawn area.
+bool decorFree(const Level &L, float x, float z) {
+    if (!clearOf(L, x, z, 1.5f)) {
+        return false;
+    }
+    for (const Box &b : L.solids) {
+        if (x >= b.min.x - 1.0f && x <= b.max.x + 1.0f && z >= b.min.z - 1.0f && z <= b.max.z + 1.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Place>
+void scatterDecor(Level &L, Rng &r, int count, float reach, Place place) {
+    int placed = 0;
+    for (int tries = 0; tries < count * 25 && placed < count; ++tries) {
+        const float x = r.range(-reach, reach);
+        const float z = r.range(-reach, reach);
+        if (decorFree(L, x, z)) {
+            place(x, z);
+            ++placed;
+        }
+    }
+}
+
+void scatterColouredTrees(Level &L, Rng &r, float reach, int count, Color crown) {
+    scatterDecor(L, r, count, reach, [&](float x, float z) {
+        const float h = r.range(6.0f, 8.0f);
+        addProp(L, PropKind::Tree, x, z, h * 0.3f, h, h * 0.3f, crown, Color{95, 65, 40, 255}, false);
+    });
+}
+
+// Adds the active event's props to a finished map.
+static void decorateSeason(Level &L) {
+    const float reach = L.terrain.half - 14.0f;
+    Rng r{4242u + static_cast<unsigned>(L.props.size())};
+    switch (seasonInfo().decor) {
+    case SeasonDecor::None:
+        break;
+    case SeasonDecor::Pumpkins:
+        scatterDecor(L, r, 40, reach, [&](float x, float z) {
+            const float s = r.range(0.9f, 1.3f);
+            addProp(L, PropKind::Pumpkin, x, z, s, s * 0.9f, s, Color{255, 125, 25, 255}, Color{70, 120, 40, 255},
+                    false);
+            L.bulbs.push_back(Vector3{x, groundAt(L.terrain, x, z) + s, z});
+        });
+        break;
+    case SeasonDecor::Hearts:
+        scatterDecor(L, r, 35, reach, [&](float x, float z) {
+            const float s = r.range(0.8f, 1.2f);
+            addProp(L, PropKind::Heart, x, z, s, s * 1.2f, s * 0.3f, Color{230, 30, 70, 255}, Color{255, 150, 180, 255},
+                    false);
+        });
+        break;
+    case SeasonDecor::Blossom:
+        scatterColouredTrees(L, r, reach, 16, Color{255, 160, 205, 255});
+        scatterDecor(L, r, 40, reach, [&](float x, float z) {
+            const float s = r.range(1.5f, 2.5f);
+            addProp(L, PropKind::Flat, x, z, s, 0.08f, s, Color{255, 190, 220, 255}, Color{255, 190, 220, 255}, false);
+        });
+        break;
+    case SeasonDecor::Easter:
+        scatterDecor(L, r, 70, reach, [&](float x, float z) {
+            const float s = r.range(0.5f, 0.7f);
+            addProp(L, PropKind::Egg, x, z, s, s * 1.3f, s, pick(r, EggColors), pick(r, EggColors), false);
+        });
+        scatterDecor(L, r, 10, reach, [&](float x, float z) {
+            addProp(L, PropKind::Bunny, x, z, 0.8f, 1.3f, 0.8f, Color{250, 250, 250, 255}, Color{255, 160, 200, 255},
+                    false);
+        });
+        scatterColouredTrees(L, r, reach, 12, Color{255, 160, 205, 255});
+        break;
+    case SeasonDecor::Christmas:
+        scatterDecor(L, r, 14, reach, [&](float x, float z) {
+            const float h = r.range(6.0f, 8.0f);
+            addProp(L, PropKind::Tree, x, z, h * 0.35f, h, h * 0.35f, Color{25, 95, 45, 255}, Color{95, 65, 40, 255},
+                    false);
+            for (int k = 0; k < 4; ++k) {
+                const float px = x + r.range(-2.5f, 2.5f), pz = z + r.range(-2.5f, 2.5f);
+                if (decorFree(L, px, pz)) {
+                    const float s = r.range(0.6f, 1.0f);
+                    addProp(L, PropKind::Gift, px, pz, s, s, s, pick(r, GiftColors), Color{240, 200, 60, 255}, false);
+                }
+            }
+        });
+        break;
+    case SeasonDecor::Leaves:
+        scatterDecor(L, r, 60, reach, [&](float x, float z) {
+            const float s = r.range(2.0f, 4.0f);
+            addProp(L, PropKind::Flat, x, z, s, 0.12f, s, pick(r, LeafColors), pick(r, LeafColors), false);
+        });
+        scatterColouredTrees(L, r, reach, 10, Color{220, 110, 30, 255});
+        break;
+    case SeasonDecor::Sprinklers:
+        scatterDecor(L, r, 14, reach, [&](float x, float z) {
+            addProp(L, PropKind::Flat, x, z, 3.5f, 0.08f, 3.5f, Color{70, 150, 220, 255}, Color{70, 150, 220, 255},
+                    false);
+            addProp(L, PropKind::Sprinkler, x, z, 0.5f, 1.0f, 0.5f, Color{90, 95, 100, 255}, Color{130, 210, 255, 255},
+                    false);
+        });
+        break;
+    }
+}
+
+// Blends the active seasonal tint into a finished map. The default event leaves maps unchanged.
+static void applySeasonTint(Level &L) {
+    const SeasonInfo &s = seasonInfo();
+    if (s.tintAmount <= 0.0f) {
+        return;
+    }
+    const float t = s.tintAmount;
+    auto tint = [&](Color c) { return blendTowards(c, s.tint, t); };
+    L.sky = tint(L.sky);
+    L.terrain.grass = tint(L.terrain.grass);
+    L.terrain.dirt = tint(L.terrain.dirt);
+    for (Plot &p : L.terrain.plots) {
+        p.color = tint(p.color);
+    }
+    for (Field &f : L.terrain.fields) {
+        f.light = tint(f.light);
+        f.dark = tint(f.dark);
+    }
+    for (Prop &p : L.props) {
+        p.color = tint(p.color);
+        p.accent = tint(p.accent);
+    }
+    if (s.sky.a > 0) {
+        L.sky = s.sky;
+    }
+}
+
 void finishLevel(Level &L) {
+    applySeasonTint(L);
+    decorateSeason(L);
     L.model = LoadModelFromMesh(buildTerrainMesh(L.terrain, TerrainCells));
     L.modelLoaded = true;
 }

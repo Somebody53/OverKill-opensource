@@ -30,6 +30,7 @@ WIN_AVAILABLE := $(shell command -v x86_64-w64-mingw32-g++ 2>/dev/null)
 
 all: $(TARGET) $(DESKTOP) mods $(if $(WIN_AVAILABLE),windows)
 	@if [ -d music ]; then rm -rf build/music && cp -r music build/; fi
+	@if [ -d assets ]; then rm -rf build/assets && cp -r assets build/; fi
 
 $(DESKTOP): $(TARGET)
 	printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=OverKill opensource' 'Exec=$(CURDIR)/$(TARGET)' 'Path=$(CURDIR)/build' 'Icon=$(CURDIR)/$(LOGO_PNG)' 'Terminal=false' 'Categories=Game;' > $@
