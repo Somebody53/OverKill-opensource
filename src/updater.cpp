@@ -87,6 +87,53 @@ std::string buildScript(const std::string &outDir) {
       << "set -e\n"
       << "OUT=" << shellQuote(outDir) << "\n";
     s << R"SH(
+need=0
+for c in g++ make curl tar cargo; do command -v "$c" >/dev/null 2>&1 || need=1; done
+for h in GL/gl.h curl/curl.h X11/Xlib.h X11/extensions/Xrandr.h X11/extensions/Xinerama.h X11/extensions/XInput2.h X11/Xcursor/Xcursor.h alsa/asoundlib.h; do
+  [ -f "/usr/include/$h" ] || need=1
+done
+if [ "$need" = 1 ]; then
+  echo "STAGE deps"
+  . /etc/os-release 2>/dev/null || true
+  ids=" $ID $ID_LIKE "
+  upd=""
+  case "$ids" in
+    *" debian "*|*" ubuntu "*|*" kali "*|*" linuxmint "*|*" pop "*|*" zorin "*|*" elementary "*|*" raspbian "*|*" mx "*|*" parrot "*|*" devuan "*|*" deepin "*|*" kubuntu "*|*" lubuntu "*|*" xubuntu "*|*" neon "*)
+      upd="apt-get update &&"
+      pm="apt-get install -y"
+      pkgs="build-essential make curl tar cargo libgl-dev libx11-dev libxrandr-dev libxinerama-dev libxi-dev libxcursor-dev libasound2-dev libcurl4-openssl-dev" ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" nobara "*|*" rocky "*|*" almalinux "*|*" ol "*|*" amzn "*)
+      pm="dnf install -y"
+      pkgs="gcc-c++ make curl tar cargo mesa-libGL-devel libX11-devel libXrandr-devel libXinerama-devel libXi-devel libXcursor-devel alsa-lib-devel libcurl-devel" ;;
+    *" arch "*|*" manjaro "*|*" endeavouros "*|*" garuda "*|*" cachyos "*|*" artix "*)
+      pm="pacman -S --needed --noconfirm"
+      pkgs="base-devel curl tar rust libglvnd libx11 libxrandr libxinerama libxi libxcursor alsa-lib" ;;
+    *" suse "*|*" opensuse "*)
+      pm="zypper --non-interactive install"
+      pkgs="gcc-c++ make curl tar cargo Mesa-libGL-devel libX11-devel libXrandr-devel libXinerama-devel libXi-devel libXcursor-devel alsa-devel libcurl-devel" ;;
+    *" alpine "*)
+      pm="apk add --no-cache"
+      pkgs="build-base curl tar cargo mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxi-dev libxcursor-dev alsa-lib-dev curl-dev" ;;
+    *" void "*)
+      upd="xbps-install -S &&"
+      pm="xbps-install -y"
+      pkgs="base-devel curl tar cargo MesaLib-devel libX11-devel libXrandr-devel libXinerama-devel libXi-devel libXcursor-devel alsa-lib-devel libcurl-devel" ;;
+    *" gentoo "*)
+      pm="emerge --noreplace"
+      pkgs="sys-devel/gcc dev-build/make net-misc/curl app-arch/tar dev-lang/rust media-libs/mesa x11-libs/libX11 x11-libs/libXrandr x11-libs/libXinerama x11-libs/libXi x11-libs/libXcursor media-libs/alsa-lib" ;;
+    *" solus "*)
+      pm="eopkg install -y"
+      pkgs="system.devel curl tar cargo libgl-devel libx11-devel libxrandr-devel libxinerama-devel libxi-devel libxcursor-devel alsa-lib-devel libcurl-devel" ;;
+    *)
+      echo "ERR unsupported distro ($ID): install g++, make, curl, tar, cargo and the OpenGL, X11, Xrandr, Xinerama, Xi, Xcursor, ALSA and libcurl development packages"; exit 1 ;;
+  esac
+  if [ "$(id -u)" = 0 ]; then root=""
+  elif command -v pkexec >/dev/null 2>&1; then root="pkexec"
+  elif sudo -n true 2>/dev/null; then root="sudo -n"
+  else echo "ERR missing packages: run as root: $pm $pkgs"; exit 1; fi
+  echo "DEPS installing for $ID"
+  $root sh -c "$upd $pm $pkgs" || { echo "ERR package install failed"; exit 1; }
+fi
 URL='https://github.com/Somebody53/OverKill-opensource/archive/refs/heads/main.tar.gz'
 echo "STAGE download"
 tmp=$(mktemp -d /tmp/overkill-update.XXXXXX)
