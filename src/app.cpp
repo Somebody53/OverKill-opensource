@@ -6043,6 +6043,41 @@ void drawKillFeed(const Game &g) {
     }
 }
 
+struct ChatLine {
+    std::string text;
+    float timer = 0.0f;  // seconds left; the line fades in its last second
+};
+std::vector<ChatLine> gChatLog;
+std::string gChatInput;
+bool gChatOpen = false;
+constexpr size_t ChatMaxLines = 8;
+constexpr size_t ChatMaxInput = 100;
+constexpr float ChatShowTime = 8.0f;
+
+void addChatLine(const std::string &text) {
+    gChatLog.push_back(ChatLine{text, ChatShowTime});
+    if (gChatLog.size() > ChatMaxLines) {
+        gChatLog.erase(gChatLog.begin());
+    }
+}
+
+// Chat lines above the input box, fading out after a while.
+void drawChat() {
+    const int H = GetScreenHeight();
+    const int logBottom = gChatOpen ? H - 130 : H - 100;
+    const int n = static_cast<int>(gChatLog.size());
+    for (int i = 0; i < n; ++i) {
+        const ChatLine &c = gChatLog[static_cast<size_t>(i)];
+        const float alpha = gChatOpen ? 1.0f : std::clamp(c.timer, 0.0f, 1.0f);
+        DrawText(c.text.c_str(), 20, logBottom - (n - i) * 24, 20, Fade(RAYWHITE, alpha));
+    }
+    if (gChatOpen) {
+        DrawRectangle(14, H - 100, 620, 34, Fade(BLACK, 0.6f));
+        const std::string line = "> " + gChatInput + (static_cast<int>(GetTime() * 2.0) % 2 == 0 ? "_" : "");
+        DrawText(line.c_str(), 20, H - 94, 22, RAYWHITE);
+    }
+}
+
 void drawHud(const Game &g, const Playlist &pl) {
     const int acc = g.shots > 0 ? (100 * g.hits) / g.shots : 0;
     DrawText(TextFormat("Map: %s", Maps[g.mapIndex].name), 20, 20, 24, RAYWHITE);
@@ -6061,6 +6096,7 @@ void drawHud(const Game &g, const Playlist &pl) {
     drawMusicInfo(pl);
     drawDoorPrompt(g);
     drawKillFeed(g);
+    drawChat();
     if (const int di = nearDroppedWeapon(g); di >= 0) {
         const char *txt = TextFormat("[E] Pick up %s", Weapons[g.drops[static_cast<size_t>(di)].weapon].name);
         DrawText(txt, GetScreenWidth() / 2 - MeasureText(txt, 22) / 2, GetScreenHeight() - 150, 22, YELLOW);
@@ -7960,6 +7996,12 @@ void netHandleLine(Game &g, const std::string &line) {
         int fd = 0;
         ss >> fd;
         removeRemote(g, fd);
+    } else if (cmd == "FROM") {
+        int fd = 0;
+        ss >> fd;
+        std::string text;
+        std::getline(ss, text);
+        addChatLine(playerName(g, fd) + ":" + text);
     }
 }
 
@@ -8021,10 +8063,63 @@ void netFrame(Game &g, LobbyMenu &lm, float dt) {
     g.netOut.clear();
 }
 
+// Online chat: T opens the box, Enter sends through the server, Esc closes it. True when it used this frame's input.
+bool updateChat(bool online, LobbyMenu &lm, float dt) {
+    if (!gChatOpen) {
+        for (ChatLine &c : gChatLog) {
+            c.timer -= dt;
+        }
+        gChatLog.erase(std::remove_if(gChatLog.begin(), gChatLog.end(),
+                                      [](const ChatLine &c) { return c.timer <= 0.0f; }),
+                       gChatLog.end());
+        if (online && IsKeyPressed(KEY_T)) {
+            gChatOpen = true;
+            gChatInput.clear();
+            while (GetCharPressed() != 0) {}
+            return true;
+        }
+        return false;
+    }
+    if (!online) {
+        gChatOpen = false;
+        gChatInput.clear();
+        return false;
+    }
+    for (int ch = GetCharPressed(); ch != 0; ch = GetCharPressed()) {
+        if (ch >= 32 && ch < 127 && gChatInput.size() < ChatMaxInput) {
+            gChatInput += static_cast<char>(ch);
+        }
+    }
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+        if (!gChatInput.empty()) {
+            gChatInput.pop_back();
+        }
+    }
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        gChatOpen = false;
+        gChatInput.clear();
+        return true;
+    }
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        const size_t first = gChatInput.find_first_not_of(' ');
+        if (first != std::string::npos && lm.conn.isOpen()) {
+            const std::string text = gChatInput.substr(first);
+            lm.conn.sendLine("MSG " + text);
+            addChatLine("You: " + text);
+        }
+        gChatOpen = false;
+        gChatInput.clear();
+    }
+    return true;
+}
+
 // Switches a freshly reset game into a shared match with the other lobby players.
 void startOnlineMatch(Game &g, const LobbyMenu &lm) {
     g.online = true;
     g.economyPlayers = lm.players;
+    gChatLog.clear();
+    gChatOpen = false;
+    gChatInput.clear();
     g.netHost = lm.isHost;
     g.localFd = lm.myFd;
     g.localTeam = lm.myTeam == 1 ? TeamRed : TeamBlue;
@@ -8465,10 +8560,11 @@ int main() {
             continue;
         }
 
-        if (IsKeyPressed(KEY_ESCAPE) && game.shopOpen) {
+        const bool chatting = updateChat(game.online, lobbyMenu, dt);
+        if (!chatting && IsKeyPressed(KEY_ESCAPE) && game.shopOpen) {
             game.shopOpen = false;
             DisableCursor();
-        } else if (IsKeyPressed(KEY_ESCAPE)) {
+        } else if (!chatting && IsKeyPressed(KEY_ESCAPE)) {
             saveInventory(gInv, inventoryFilePath());
             EnableCursor();
             if (audio.ready) {
@@ -8492,8 +8588,10 @@ int main() {
             screen = Screen::Menu;
             continue;
         }
-        update(game, audio, dt);
-        if (!gModsLocked) {
+        if (!chatting) {
+            update(game, audio, dt);
+        }
+        if (!chatting && !gModsLocked) {
             for (const ModPlayFn hook : modPlayHooks()) {
                 hook(dt);
             }
