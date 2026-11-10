@@ -6,7 +6,11 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
-#ifndef _WIN32
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -38,9 +42,12 @@ void handleLine(UpdateTask &t, const std::string &line) {
     pushLine(t, line);
 }
 
-#ifndef _WIN32
 void runCommand(std::shared_ptr<UpdateTask> t, const std::string &cmd) {
+#ifdef _WIN32
+    FILE *p = _popen(cmd.c_str(), "r");
+#else
     FILE *p = popen(cmd.c_str(), "r");
+#endif
     if (!p) {
         pushLine(*t, "could not start the shell");
         t->exitCode = -1;
@@ -53,11 +60,14 @@ void runCommand(std::shared_ptr<UpdateTask> t, const std::string &cmd) {
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
         handleLine(*t, s);
     }
+#ifdef _WIN32
+    t->exitCode = _pclose(p);
+#else
     const int status = pclose(p);
     t->exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
     t->running = false;
 }
-#endif
 
 std::string shellQuote(const std::string &s) {
     std::string out = "'";
@@ -108,9 +118,114 @@ echo "STAGE done"
     return s.str();
 }
 
+#ifdef _WIN32
+std::string winQuote(const std::string &s) {
+    return "\"" + s + "\"";
+}
+
+std::string windowsBuildScript() {
+    return R"PS(param([string]$OutDir, [string]$ToolsDir)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$headers = @{ 'User-Agent' = 'OverKillUpdater' }
+
+function Fail([string]$msg) {
+    Write-Output "ERR $msg"
+    throw $msg
+}
+
+Write-Output 'STAGE tools'
+New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+
+# Reuse tools downloaded by an earlier update.
+$devBin = Join-Path $ToolsDir 'w64devkit\bin'
+$cargoHome = Join-Path $ToolsDir 'cargo'
+$rustupHome = Join-Path $ToolsDir 'rustup'
+if (Test-Path (Join-Path $devBin 'g++.exe')) { $env:Path = "$devBin;$env:Path" }
+if (Test-Path (Join-Path $cargoHome 'bin\cargo.exe')) {
+    $env:CARGO_HOME = $cargoHome
+    $env:RUSTUP_HOME = $rustupHome
+    $env:Path = (Join-Path $cargoHome 'bin') + ";$env:Path"
+}
+
+# g++ and make: w64devkit is downloaded only when no suitable compiler is installed.
+$gppOk = (Get-Command g++ -ErrorAction SilentlyContinue) -and (Get-Command make -ErrorAction SilentlyContinue) -and (((& g++ -dumpmachine) | Out-String) -match 'x86_64-w64-mingw')
+if (-not $gppOk) {
+    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/skeeto/w64devkit/releases/latest' -Headers $headers
+    $asset = $rel.assets | Where-Object { $_.name -like 'w64devkit-x64-*.7z.exe' } | Select-Object -First 1
+    if (-not $asset) { Fail 'the MinGW compiler release was not found' }
+    $sfx = Join-Path $ToolsDir $asset.name
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $sfx -Headers $headers
+    & $sfx "-o$ToolsDir" -y | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'the MinGW compiler could not be extracted' }
+    Remove-Item -LiteralPath $sfx -Force
+    if (-not (Test-Path (Join-Path $devBin 'g++.exe'))) { Fail 'the MinGW compiler folder was not found' }
+    $env:Path = "$devBin;$env:Path"
+}
+
+# Rust (cargo) for the AI library.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $env:CARGO_HOME = $cargoHome
+    $env:RUSTUP_HOME = $rustupHome
+    $init = Join-Path $ToolsDir 'rustup-init.exe'
+    Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile $init
+    & $init -y --profile minimal --default-toolchain stable --default-host x86_64-pc-windows-gnu --no-modify-path
+    if ($LASTEXITCODE -ne 0) { Fail 'Rust could not be installed' }
+    $env:Path = (Join-Path $cargoHome 'bin') + ";$env:Path"
+}
+if (Get-Command rustup -ErrorAction SilentlyContinue) {
+    & rustup target add x86_64-pc-windows-gnu | Out-Null
+}
+
+Write-Output 'STAGE download'
+$tmp = Join-Path $env:TEMP ('overkill-update-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmp | Out-Null
+try {
+    $zip = Join-Path $tmp 'src.zip'
+    Invoke-WebRequest -Uri 'https://github.com/Somebody53/OverKill-opensource/archive/refs/heads/main.zip' -OutFile $zip -Headers $headers
+    Write-Output 'STAGE extract'
+    Expand-Archive -LiteralPath $zip -DestinationPath $tmp
+    $mk = Get-ChildItem -LiteralPath $tmp -Filter Makefile -Recurse -Depth 3 | Select-Object -First 1
+    if (-not $mk) { Fail 'no Makefile in the downloaded source' }
+    Set-Location -LiteralPath $mk.DirectoryName
+
+    $cfg = @('WIN_CXX=g++', 'WIN_CC=gcc', 'WIN_AR=ar')
+    $goals = @('windows', 'mods')
+    $dry = & make -n @cfg @goals 2>$null
+    $total = @($dry | Where-Object { $_ -like '* -c *' }).Count
+    Write-Output "TOTAL $total"
+    Write-Output 'STAGE build'
+    & make -j $env:NUMBER_OF_PROCESSORS @cfg @goals
+    if ($LASTEXITCODE -ne 0) { Fail "make failed with exit code $LASTEXITCODE" }
+
+    Write-Output 'STAGE copy'
+    $winOut = Join-Path $OutDir 'windows'
+    $modsOut = Join-Path $OutDir 'mods'
+    New-Item -ItemType Directory -Force -Path $winOut, $modsOut | Out-Null
+    Copy-Item -LiteralPath 'build\windows\OverKillOpensource.exe' -Destination $winOut -Force
+    Copy-Item -Path 'build\mods\*' -Destination $modsOut -Recurse -Force
+    foreach ($dir in @('music', 'assets')) {
+        if (Test-Path $dir) {
+            $dest = Join-Path $OutDir $dir
+            if (Test-Path $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+            Copy-Item -LiteralPath $dir -Destination $OutDir -Recurse -Force
+        }
+    }
+    Write-Output "OUTPUT $OutDir"
+    Write-Output 'STAGE done'
+}
+finally {
+    Set-Location -LiteralPath $env:TEMP
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+)PS";
+}
+#endif
+
 } // namespace
 
-void startUpdateBuild(std::shared_ptr<UpdateTask> task, const std::string &outDir) {
+void startUpdateBuild(std::shared_ptr<UpdateTask> task, const std::string &outDir, const std::string &toolsDir) {
     {
         std::lock_guard<std::mutex> lock(task->m);
         task->lines.clear();
@@ -120,26 +235,67 @@ void startUpdateBuild(std::shared_ptr<UpdateTask> task, const std::string &outDi
     task->done = 0;
     task->exitCode = -1;
 
+    std::string cmd;
 #ifdef _WIN32
-    pushLine(*task, "The in-game update is only available on Linux for now.");
-    task->exitCode = 1;
+    const std::filesystem::path script = std::filesystem::temp_directory_path() / "overkill-update.ps1";
+    {
+        std::ofstream out(script);
+        out << windowsBuildScript();
+    }
+    cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File " + winQuote(script.string()) + " " +
+          winQuote(outDir) + " " + winQuote(toolsDir) + " 2>&1";
 #else
+    (void)toolsDir;
     const std::filesystem::path script = std::filesystem::temp_directory_path() / "overkill-update.sh";
     {
         std::ofstream out(script);
         out << buildScript(outDir);
     }
-    task->running = true;
-    const std::string cmd = "sh " + shellQuote(script.string()) + " 2>&1";
-    std::thread([task, cmd] { runCommand(task, cmd); }).detach();
+    cmd = "sh " + shellQuote(script.string()) + " 2>&1";
 #endif
+    task->running = true;
+    std::thread([task, cmd] { runCommand(task, cmd); }).detach();
 }
 
 bool installUpdate(const std::string &stagingDir, const std::string &installDir) {
 #ifdef _WIN32
-    (void)stagingDir;
-    (void)installDir;
-    return false;
+    namespace fs = std::filesystem;
+    if (!fs::exists(fs::path(stagingDir) / "windows" / "OverKillOpensource.exe")) return false;
+
+    // Waits for this process to exit, then copies the files and restarts the game.
+    const fs::path script = fs::temp_directory_path() / "overkill-install.cmd";
+    {
+        std::ofstream out(script);
+        out << "@echo off\r\n"
+            << "set \"PID=" << GetCurrentProcessId() << "\"\r\n"
+            << "set \"INSTALL=" << installDir << "\"\r\n"
+            << "set \"STAGE=" << stagingDir << "\"\r\n"
+            << ":wait\r\n"
+            << "tasklist /FI \"PID eq %PID%\" 2>nul | find \"%PID%\" >nul\r\n"
+            << "if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
+            << "call :install > \"%INSTALL%\\update.log\" 2>&1\r\n"
+            << "if errorlevel 1 exit /b 1\r\n"
+            << "start \"\" /D \"%INSTALL%\" OverKillOpensource.exe\r\n"
+            << "exit /b 0\r\n"
+            << ":install\r\n"
+            << "copy /Y \"%STAGE%\\windows\\OverKillOpensource.exe\" \"%INSTALL%\\OverKillOpensource.exe\" || exit /b 1\r\n"
+            << "if not exist \"%INSTALL%\\mods\" mkdir \"%INSTALL%\\mods\"\r\n"
+            << "xcopy /E /I /Y \"%STAGE%\\mods\" \"%INSTALL%\\mods\" || exit /b 1\r\n"
+            << "if exist \"%STAGE%\\music\" (rmdir /S /Q \"%INSTALL%\\music\" & xcopy /E /I /Y \"%STAGE%\\music\" \"%INSTALL%\\music\" || exit /b 1)\r\n"
+            << "if exist \"%STAGE%\\assets\" (rmdir /S /Q \"%INSTALL%\\assets\" & xcopy /E /I /Y \"%STAGE%\\assets\" \"%INSTALL%\\assets\" || exit /b 1)\r\n"
+            << "rmdir /S /Q \"%STAGE%\"\r\n"
+            << "exit /b 0\r\n";
+    }
+    std::string cmdline = "cmd.exe /c \"" + script.string() + "\"";
+    STARTUPINFOA si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    const BOOL started = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
+                                        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &si, &pi);
+    if (!started) return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
 #else
     namespace fs = std::filesystem;
     if (!fs::exists(fs::path(stagingDir) / "linux" / "OverKillOpensource")) return false;

@@ -7885,7 +7885,7 @@ std::string updateStagingDir() {
 void startUpdate(UpdateScreen &up) {
     up.task = std::make_shared<UpdateTask>();
     up.showLog = false;
-    startUpdateBuild(up.task, updateStagingDir());
+    startUpdateBuild(up.task, updateStagingDir(), std::string(GetApplicationDirectory()) + "build_tools");
 }
 
 bool updateFinished(const UpdateScreen &up) {
@@ -7917,6 +7917,7 @@ std::string updateStatus(const UpdateScreen &up) {
     if (updateReady(up)) return "Build finished. Press Install to replace the game and restart.";
     if (updateFinished(up)) return "Update failed. Press Down to see the output.";
     const std::string stage = currentStage(*up.task);
+    if (stage == "tools") return "Checking the build tools...";
     if (stage == "download") return "Downloading the source...";
     if (stage == "extract") return "Extracting...";
     if (stage == "build") {

@@ -12,7 +12,11 @@ GFX_LIBS := -lGL -lm -lpthread -ldl -lrt -lX11 -lutil -lgcc_s
 LDLIBS   := $(GFX_LIBS) -lcurl
 
 SOURCES := src/app.cpp src/world.cpp src/mods.cpp src/lobby_net.cpp src/server_lookup.cpp src/updater.cpp
+ifeq ($(OS),Windows_NT)
+MKLOGO      := build/windows/mklogo.exe
+else
 MKLOGO      := build/mklogo
+endif
 LOGO_HEADER := build/logo_data.h
 LOGO_PNG    := assets/logo.png
 DESKTOP     := build/OverKillOpensource.desktop
@@ -40,8 +44,10 @@ $(AI_LIB): $(wildcard $(AI_DIR)/src/*.rs) $(AI_DIR)/Cargo.toml
 build/obj/%.o: src/%.cpp $(HEADERS) $(LOGO_HEADER) $(RAYLIB_LIB) | build/obj
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+ifneq ($(OS),Windows_NT)
 $(MKLOGO): tools/mklogo.cpp src/logo.h $(RAYLIB_LIB) | build/obj
 	$(CXX) $(CXXFLAGS) tools/mklogo.cpp -o $@ $(RAYLIB_LIB) $(GFX_LIBS)
+endif
 
 $(LOGO_PNG) $(LOGO_HEADER): $(MKLOGO)
 	mkdir -p assets
@@ -50,14 +56,16 @@ $(LOGO_PNG) $(LOGO_HEADER): $(MKLOGO)
 build/obj:
 	mkdir -p $@
 
-$(RAYLIB_LIB):
+$(RAYLIB_DIR)/src/raylib.h:
 	mkdir -p third_party
 	curl -L -o third_party/raylib-$(RAYLIB_VERSION).tar.gz \
 		https://github.com/raysan5/raylib/archive/refs/tags/$(RAYLIB_VERSION).tar.gz
 	tar -xzf third_party/raylib-$(RAYLIB_VERSION).tar.gz -C third_party
+
+$(RAYLIB_LIB): $(RAYLIB_DIR)/src/raylib.h
 	$(MAKE) -C $(RAYLIB_DIR)/src PLATFORM=PLATFORM_DESKTOP RAYLIB_LIBTYPE=STATIC
 
-mods: | build/mods
+mods: $(RAYLIB_DIR)/src/raylib.h | build/mods
 	cp src/modapi.h $(RAYLIB_DIR)/src/raylib.h modtutorial.txt build/mods/
 
 build/mods:
@@ -77,11 +85,11 @@ WIN_CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -I$(WIN_RAYLIB_DIR)/src -Ibuild
 WIN_LDLIBS     := -lopengl32 -lgdi32 -lwinmm -lws2_32 -lpthread -luserenv -lbcrypt -ladvapi32 -lntdll -lwinhttp
 
 # Windows cross-build (mingw-w64). Raylib is built from a copy so the Linux objects are untouched.
-$(WIN_RAYLIB_LIB):
+$(WIN_RAYLIB_LIB): $(RAYLIB_DIR)/src/raylib.h
 	mkdir -p $(WIN_DIR)
 	rm -rf $(WIN_RAYLIB_DIR)
 	cp -r $(RAYLIB_DIR) $(WIN_RAYLIB_DIR)
-	$(MAKE) -C $(WIN_RAYLIB_DIR)/src clean
+	-$(MAKE) -C $(WIN_RAYLIB_DIR)/src clean
 	$(MAKE) -C $(WIN_RAYLIB_DIR)/src PLATFORM=PLATFORM_DESKTOP PLATFORM_OS=WINDOWS RAYLIB_LIBTYPE=STATIC CC=$(WIN_CC) AR=$(WIN_AR)
 	cp $(WIN_RAYLIB_DIR)/src/libraylib.a $@
 
@@ -99,6 +107,12 @@ $(WIN_TARGET): $(WIN_OBJECTS) $(WIN_RAYLIB_LIB) $(WIN_AI_LIB)
 
 windows: $(WIN_TARGET)
 	@if [ -d music ]; then rm -rf $(WIN_DIR)/music && cp -r music $(WIN_DIR)/; fi
+
+ifeq ($(OS),Windows_NT)
+$(MKLOGO): tools/mklogo.cpp src/logo.h $(WIN_RAYLIB_LIB)
+	mkdir -p build/windows
+	$(WIN_CXX) $(WIN_CXXFLAGS) tools/mklogo.cpp -o $@ $(WIN_RAYLIB_LIB) $(WIN_LDLIBS)
+endif
 
 clean:
 	rm -rf build

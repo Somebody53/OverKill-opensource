@@ -17,8 +17,8 @@ struct UpdateTask {
     std::string stage;               // guarded by m
 };
 
-// Downloads the newest source from GitHub and builds the Linux (and Windows, if MinGW exists) client into outDir.
-void startUpdateBuild(std::shared_ptr<UpdateTask> task, const std::string &outDir);
+// Downloads the newest source from GitHub and builds the client into outDir. toolsDir holds downloaded build tools.
+void startUpdateBuild(std::shared_ptr<UpdateTask> task, const std::string &outDir, const std::string &toolsDir);
 
 // Replaces the installed game files from stagingDir and restarts the game once this process exits.
 // Settings are not touched. Returns false if nothing could be installed.
