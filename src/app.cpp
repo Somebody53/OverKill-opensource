@@ -492,6 +492,7 @@ struct Playlist {
     bool loaded = false;
     float volume = 0.4f;
     bool muted = false;
+    bool paused = false;
 };
 
 struct Audio {
@@ -4095,6 +4096,9 @@ void loadTrack(Playlist &pl, int index) {
     pl.current = index;
     SetMusicVolume(pl.music, pl.muted ? 0.0f : pl.volume);
     PlayMusicStream(pl.music);
+    if (pl.paused) {
+        PauseMusicStream(pl.music);
+    }
 }
 
 // Next track in playlist order, wrapping around to the first.
@@ -4104,7 +4108,7 @@ int pickNext(const Playlist &pl) {
 }
 
 void updatePlaylist(Playlist &pl) {
-    if (!pl.loaded) {
+    if (!pl.loaded || pl.paused) {
         return;
     }
     UpdateMusicStream(pl.music);
@@ -4115,7 +4119,38 @@ void updatePlaylist(Playlist &pl) {
     }
 }
 
+struct ChatLine {
+    std::string text;
+    float timer = 0.0f;  // seconds left; the line fades in its last second
+};
+std::vector<ChatLine> gChatLog;
+std::string gChatInput;
+bool gChatOpen = false;
+constexpr size_t ChatMaxLines = 8;
+constexpr size_t ChatMaxInput = 100;
+constexpr float ChatShowTime = 8.0f;
+
+void setMusicPaused(Playlist &pl, bool paused) {
+    pl.paused = paused;
+    if (!pl.loaded) {
+        return;
+    }
+    if (paused) {
+        PauseMusicStream(pl.music);
+    } else {
+        ResumeMusicStream(pl.music);
+    }
+}
+
+// Play/pause button under the music bar; click it while the cursor is visible.
+Rectangle musicButtonRect() {
+    return Rectangle{20.0f, static_cast<float>(GetScreenHeight() - 120), 120.0f, 26.0f};
+}
+
 void handleMusicKeys(Playlist &pl) {
+    if (gChatOpen) {
+        return;
+    }
     const int n = static_cast<int>(pl.tracks.size());
     if (n > 0) {
         if (IsKeyPressed(KEY_RIGHT)) {
@@ -4133,6 +4168,9 @@ void handleMusicKeys(Playlist &pl) {
     }
     if (IsKeyPressed(KEY_M)) {
         pl.muted = !pl.muted;
+    }
+    if (IsKeyPressed(KEY_P) || (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), musicButtonRect()))) {
+        setMusicPaused(pl, !pl.paused);
     }
 }
 
@@ -4982,6 +5020,15 @@ void drawMusicInfo(const Playlist &pl) {
     const float frac = len > 0.0f ? std::clamp(played / len, 0.0f, 1.0f) : 0.0f;
     DrawRectangle(20, H - 88, 400, 8, Color{60, 60, 70, 255});
     DrawRectangle(20, H - 88, static_cast<int>(400.0f * frac), 8, Color{200, 70, 50, 255});
+    const Rectangle btn = musicButtonRect();
+    const bool hot = CheckCollisionPointRec(GetMousePosition(), btn);
+    DrawRectangleRec(btn, hot ? Color{70, 70, 85, 255} : Color{40, 40, 52, 255});
+    DrawRectangleLinesEx(btn, 2.0f, RAYWHITE);
+    const char *label = pl.paused ? "Play  (P)" : "Pause (P)";
+    const Vector2 size = MeasureTextEx(gMusicFont, label, MusicFontSize, 0.0f);
+    DrawTextEx(gMusicFont, label,
+               Vector2{btn.x + (btn.width - size.x) / 2.0f, btn.y + (btn.height - size.y) / 2.0f},
+               MusicFontSize, 0.0f, RAYWHITE);
 }
 
 // Point on a fighter: forward along its facing, side and height from its feet.
@@ -6042,17 +6089,6 @@ void drawKillFeed(const Game &g) {
         y += 28;
     }
 }
-
-struct ChatLine {
-    std::string text;
-    float timer = 0.0f;  // seconds left; the line fades in its last second
-};
-std::vector<ChatLine> gChatLog;
-std::string gChatInput;
-bool gChatOpen = false;
-constexpr size_t ChatMaxLines = 8;
-constexpr size_t ChatMaxInput = 100;
-constexpr float ChatShowTime = 8.0f;
 
 void addChatLine(const std::string &text) {
     gChatLog.push_back(ChatLine{text, ChatShowTime});
@@ -7721,7 +7757,7 @@ void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Play
     const int H = GetScreenHeight();
     const char *hint = "WASD or mouse to choose   Wheel to scroll   Enter or click to play   Q to quit";
     DrawText(hint, GetScreenWidth() / 2 - MeasureText(hint, 18) / 2, H - 30, 18, GRAY);
-    const char *music = "Left/Right: track   Up/Down: volume   M: mute";
+    const char *music = "Left/Right: track   Up/Down: volume   M: mute   P: play/pause";
     DrawText(music, GetScreenWidth() / 2 - MeasureText(music, 18) / 2, H - 52, 18, GRAY);
     drawMusicInfo(pl);
     drawSettingsButton();
@@ -8343,6 +8379,7 @@ int main() {
                     playAt(audio.waveStart, 0.7f, 0.5f);
                 }
                 if (!audio.playlist.tracks.empty()) {
+                    audio.playlist.paused = true;
                     loadTrack(audio.playlist, pickNext(audio.playlist));
                 }
             }
@@ -8405,6 +8442,7 @@ int main() {
             const bool othersReady = !load.online || lobbyMenu.allLoaded || load.t >= LoadLaunchTime + LoadMaxWait;
             if (minDone && othersReady) {
                 DisableCursor();
+                setMusicPaused(audio.playlist, true);
                 screen = Screen::Playing;
                 continue;
             }
@@ -8448,6 +8486,7 @@ int main() {
             if (pick >= 0) {
                 resetGame(game, pick);
                 load = makeMapLoad(pick, false);
+                setMusicPaused(audio.playlist, true);
                 screen = Screen::Loading;
                 continue;
             }
@@ -8530,6 +8569,7 @@ int main() {
                     lobbyMenu.conn.sendLine("LOADED");
                 }
                 load = makeMapLoad(lobbyMenu.map, online);
+                setMusicPaused(audio.playlist, true);
                 screen = Screen::Loading;
                 continue;
             }
@@ -8567,6 +8607,7 @@ int main() {
         } else if (!chatting && IsKeyPressed(KEY_ESCAPE)) {
             saveInventory(gInv, inventoryFilePath());
             EnableCursor();
+            setMusicPaused(audio.playlist, false);
             if (audio.ready) {
                 StopSound(audio.wind);
             }
