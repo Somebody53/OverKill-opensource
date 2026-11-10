@@ -15,6 +15,7 @@ namespace {
 // Public PlayFab title ID. Safe to ship in the client. Never put the secret key here.
 constexpr const char *PlayFabTitleId = "16FD4";
 constexpr const char *PlayFabTitleDataKey = "ServerAddress";
+constexpr const char *PlayFabVersionKey = "GameVersion";
 
 // Extracts a simple "key":"value" string field (values here contain no escapes).
 std::string jsonStringField(const std::string &text, const std::string &key) {
@@ -162,7 +163,8 @@ ServerLookup lookupServerAddress(const std::string &customId) {
     }
 
     std::string response;
-    const std::string dataBody = std::string("{\"Keys\":[\"") + PlayFabTitleDataKey + "\"]}";
+    const std::string dataBody = std::string("{\"Keys\":[\"") + PlayFabTitleDataKey + "\",\"" +
+                                 PlayFabVersionKey + "\"]}";
     if (!postJson(playFabHost(), "/Client/GetTitleData", dataBody, ticket, response, result.error)) {
         return result;
     }
@@ -174,6 +176,7 @@ ServerLookup lookupServerAddress(const std::string &customId) {
 
     result.ok = true;
     result.address = address;
+    result.latestVersion = jsonStringField(response, PlayFabVersionKey);
     return result;
 }
 

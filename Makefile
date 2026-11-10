@@ -11,7 +11,7 @@ CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -I$(RAYLIB_DIR)/src -Ibuild
 GFX_LIBS := -lGL -lm -lpthread -ldl -lrt -lX11 -lutil -lgcc_s
 LDLIBS   := $(GFX_LIBS) -lcurl
 
-SOURCES := src/app.cpp src/world.cpp src/mods.cpp src/lobby_net.cpp src/server_lookup.cpp
+SOURCES := src/app.cpp src/world.cpp src/mods.cpp src/lobby_net.cpp src/server_lookup.cpp src/updater.cpp
 MKLOGO      := build/mklogo
 LOGO_HEADER := build/logo_data.h
 LOGO_PNG    := assets/logo.png

@@ -9,6 +9,7 @@
 #include "skins.h"
 #include "lobby_net.h"
 #include "server_lookup.h"
+#include "updater.h"
 #include <memory>
 #include <set>
 #include <sstream>
@@ -249,7 +250,7 @@ const MapDef Maps[] = {
 };
 constexpr int MapCount = static_cast<int>(std::size(Maps));
 
-enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Lobby, Intro, Loading };
+enum class Screen { Menu, Settings, Playing, Mods, Avatar, Cases, Lobby, Intro, Loading, Update };
 
 // Set each frame: true while joined to a public lobby, which blocks mods.
 bool gModsLocked = false;
@@ -385,6 +386,7 @@ Look gPlayerLook;
 constexpr size_t MaxNameLen = 16;
 std::string gPlayerName;
 std::string gServerAddress = "127.0.0.1:7777";
+std::string gLatestVersion; // newest version from PlayFab, empty if unknown
 std::string gPlayerCustomId;
 std::future<ServerLookup> gServerLookup;
 
@@ -7452,9 +7454,13 @@ void applyServerLookup(LobbyMenu &lm) {
         return;
     }
     gServerAddress = found.address;
+    gLatestVersion = found.latestVersion;
     lm.fields[LobbyAddress] = found.address;
     saveSettings();
     lm.status = "Server address loaded from PlayFab";
+    if (!gLatestVersion.empty() && gLatestVersion != GameVersion) {
+        lm.status += ". Update available: v" + gLatestVersion;
+    }
 }
 
 void startServerLookup(LobbyMenu &lm) {
@@ -7839,6 +7845,154 @@ void drawMapCards(const MenuState &menu, const RenderTexture2D *previews) {
     }
 }
 
+bool updateAvailable() {
+    return !gLatestVersion.empty() && gLatestVersion != GameVersion;
+}
+
+Rectangle updateButtonRect() {
+    return Rectangle{GetScreenWidth() - 190.0f, 212.0f, 170.0f, 40.0f};
+}
+
+bool updateButtonPressed() {
+    return updateAvailable() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+           CheckCollisionPointRec(GetMousePosition(), updateButtonRect());
+}
+
+void drawUpdateButton() {
+    if (!updateAvailable()) {
+        return;
+    }
+    const Rectangle r = updateButtonRect();
+    const bool hot = CheckCollisionPointRec(GetMousePosition(), r);
+    DrawRectangleRec(r, hot ? Color{110, 90, 30, 255} : Color{80, 64, 20, 255});
+    DrawRectangleLinesEx(r, 2.0f, GOLD);
+    const char *label = TextFormat("Update v%s", gLatestVersion.c_str());
+    DrawText(label, static_cast<int>(r.x + r.width / 2) - MeasureText(label, 22) / 2, static_cast<int>(r.y) + 9, 22,
+             GOLD);
+}
+
+// ---- In-game updater --------------------------------------------------------
+
+struct UpdateScreen {
+    std::shared_ptr<UpdateTask> task;
+    bool showLog = false;
+};
+
+std::string updateStagingDir() {
+    return std::string(GetApplicationDirectory()) + "update_staging";
+}
+
+void startUpdate(UpdateScreen &up) {
+    up.task = std::make_shared<UpdateTask>();
+    up.showLog = false;
+    startUpdateBuild(up.task, updateStagingDir());
+}
+
+bool updateFinished(const UpdateScreen &up) {
+    return up.task && !up.task->running;
+}
+
+bool updateReady(const UpdateScreen &up) {
+    return updateFinished(up) && up.task->exitCode == 0;
+}
+
+float updateProgress(const UpdateScreen &up) {
+    if (!up.task) return 0.0f;
+    if (updateReady(up)) return 1.0f;
+    if (updateFinished(up)) return 0.0f;
+    const std::string stage = currentStage(*up.task);
+    if (stage == "download") return 0.05f;
+    if (stage == "extract") return 0.15f;
+    if (stage == "copy") return 0.95f;
+    if (stage == "build") {
+        const int total = up.task->total.load();
+        const float part = total > 0 ? static_cast<float>(up.task->done.load()) / total : 0.0f;
+        return 0.2f + 0.75f * std::min(part, 1.0f);
+    }
+    return 0.02f;
+}
+
+std::string updateStatus(const UpdateScreen &up) {
+    if (!up.task) return "";
+    if (updateReady(up)) return "Build finished. Press Install to replace the game and restart.";
+    if (updateFinished(up)) return "Update failed. Press Down to see the output.";
+    const std::string stage = currentStage(*up.task);
+    if (stage == "download") return "Downloading the source...";
+    if (stage == "extract") return "Extracting...";
+    if (stage == "build") {
+        return "Compiling " + std::to_string(up.task->done.load()) + " / " + std::to_string(up.task->total.load());
+    }
+    if (stage == "copy") return "Copying the new files...";
+    return "Starting...";
+}
+
+Rectangle updateBackRect() {
+    return Rectangle{60.0f, GetScreenHeight() - 80.0f, 170.0f, 44.0f};
+}
+
+Rectangle updateInstallRect() {
+    return Rectangle{GetScreenWidth() - 230.0f, GetScreenHeight() - 80.0f, 170.0f, 44.0f};
+}
+
+void drawUpdateButtonRect(const Rectangle &r, const char *label, bool enabled) {
+    const bool hot = enabled && CheckCollisionPointRec(GetMousePosition(), r);
+    DrawRectangleRec(r, !enabled ? Color{30, 32, 42, 255} : hot ? Color{70, 74, 96, 255} : Color{40, 42, 56, 255});
+    DrawRectangleLinesEx(r, 2.0f, enabled ? RAYWHITE : GRAY);
+    DrawText(label, static_cast<int>(r.x + r.width / 2) - MeasureText(label, 22) / 2, static_cast<int>(r.y) + 11, 22,
+             enabled ? RAYWHITE : GRAY);
+}
+
+// Returns 0 to stay, 1 to go back to the menu, 2 to quit so the update can be installed.
+int updateUpdateScreen(UpdateScreen &up) {
+    const bool busy = up.task && up.task->running;
+    const bool ready = updateReady(up);
+    if (IsKeyPressed(KEY_DOWN)) {
+        up.showLog = !up.showLog;
+    }
+    const Vector2 m = GetMousePosition();
+    const bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    if (!busy && (IsKeyPressed(KEY_ESCAPE) || (click && CheckCollisionPointRec(m, updateBackRect())))) {
+        return 1;
+    }
+    if (ready && (IsKeyPressed(KEY_ENTER) || (click && CheckCollisionPointRec(m, updateInstallRect())))) {
+        return installUpdate(updateStagingDir(), GetApplicationDirectory()) ? 2 : 0;
+    }
+    return 0;
+}
+
+void drawUpdateScreen(const UpdateScreen &up) {
+    const int W = GetScreenWidth();
+    const int H = GetScreenHeight();
+    DrawText(TextFormat("Updating to v%s", gLatestVersion.c_str()), 60, 40, 32, RAYWHITE);
+
+    const Rectangle bar{60.0f, 110.0f, W - 120.0f, 28.0f};
+    const float frac = updateProgress(up);
+    DrawRectangleRec(bar, Color{40, 42, 56, 255});
+    DrawRectangleRec(Rectangle{bar.x, bar.y, bar.width * frac, bar.height}, GOLD);
+    DrawRectangleLinesEx(bar, 2.0f, RAYWHITE);
+    const std::string pct = std::to_string(static_cast<int>(frac * 100.0f)) + "%";
+    DrawText(pct.c_str(), static_cast<int>(bar.x + bar.width / 2) - MeasureText(pct.c_str(), 18) / 2, 115, 18, RAYWHITE);
+    DrawText(updateStatus(up).c_str(), 60, 150, 20, LIGHTGRAY);
+
+    if (!up.showLog || !up.task) {
+        DrawText("Press Down to show the output", 60, 190, 18, GRAY);
+    } else {
+        const Rectangle panel{60.0f, 190.0f, W - 120.0f, H - 290.0f};
+        DrawRectangleRec(panel, Color{12, 13, 20, 255});
+        DrawRectangleLinesEx(panel, 1.0f, GRAY);
+        const size_t rows = static_cast<size_t>((panel.height - 16.0f) / 18.0f);
+        int y = static_cast<int>(panel.y) + 8;
+        for (const std::string &line : tailLines(*up.task, rows)) {
+            DrawText(line.substr(0, 180).c_str(), 72, y, 16, LIGHTGRAY);
+            y += 18;
+        }
+    }
+
+    const bool busy = up.task && up.task->running;
+    drawUpdateButtonRect(updateBackRect(), "Back", !busy);
+    drawUpdateButtonRect(updateInstallRect(), "Install", updateReady(up));
+}
+
 void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Playlist &pl) {
     drawLogo();
     drawAvatarTile();
@@ -7855,11 +8009,16 @@ void drawMenu(const MenuState &menu, const RenderTexture2D *previews, const Play
     DrawText(music, GetScreenWidth() / 2 - MeasureText(music, 18) / 2, H - 52, 18, GRAY);
     const char *version = TextFormat("v%s", GameVersion);
     DrawText(version, GetScreenWidth() - MeasureText(version, 18) - 12, H - 30, 18, GRAY);
+    if (!gLatestVersion.empty() && gLatestVersion != GameVersion) {
+        const char *notice = TextFormat("Update available: v%s", gLatestVersion.c_str());
+        DrawText(notice, GetScreenWidth() - MeasureText(notice, 18) - 12, H - 52, 18, GOLD);
+    }
     drawMusicInfo(pl);
     drawSettingsButton();
     drawModsButton();
     drawCasesButton();
     drawLobbyMenuButton();
+    drawUpdateButton();
 }
 
 void drawVote(const LobbyMenu &lm, const RenderTexture2D *previews) {
@@ -8421,6 +8580,7 @@ int main() {
     AvatarMenu avatarMenu;
     CasesMenu casesMenu;
     LobbyMenu lobbyMenu;
+    UpdateScreen upd;
     lobbyMenu.fields[LobbyAddress] = gServerAddress;
     for (int i = 0; i < MapCount; ++i) {
         Maps[i].build(previews[i]);
@@ -8561,6 +8721,11 @@ int main() {
                 screen = Screen::Lobby;
                 continue;
             }
+            if (updateButtonPressed()) {
+                startUpdate(upd);
+                screen = Screen::Update;
+                continue;
+            }
             const int pick = updateMenu(menu, dt);
             if (pick >= 0) {
                 resetGame(game, pick);
@@ -8580,6 +8745,22 @@ int main() {
             BeginDrawing();
             ClearBackground(Color{20, 22, 35, 255});
             drawMenu(menu, previewTex, audio.playlist);
+            EndDrawing();
+            continue;
+        }
+
+        if (screen == Screen::Update) {
+            const int result = updateUpdateScreen(upd);
+            if (result == 1) {
+                screen = Screen::Menu;
+                continue;
+            }
+            if (result == 2) {
+                break;
+            }
+            BeginDrawing();
+            ClearBackground(Color{20, 22, 35, 255});
+            drawUpdateScreen(upd);
             EndDrawing();
             continue;
         }
